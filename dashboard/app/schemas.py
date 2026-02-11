@@ -51,10 +51,35 @@ class VMHostActionRequest(BaseModel):
     action: VMAction
 
 
+class VMImportRequest(BaseModel):
+    host_id: str
+    vm_id: str
+    name: str
+    cpu_cores: int
+    memory_mb: int
+    image: str
+    power_state: str = "stopped"
+    networks: list[str] = Field(default_factory=list)
+    labels: dict[str, str] = Field(default_factory=dict)
+    annotations: dict[str, str] = Field(default_factory=dict)
+    created_at: str
+
+
 class VMResizeRequest(BaseModel):
     host_id: str
     cpu_cores: int
     memory_mb: int
+
+
+class VMCloneRequest(BaseModel):
+    host_id: str
+    name: str
+
+
+class VMMetadataRequest(BaseModel):
+    host_id: str
+    labels: dict[str, str] = Field(default_factory=dict)
+    annotations: dict[str, str] = Field(default_factory=dict)
 
 
 class VMMigrateRequest(BaseModel):
@@ -87,6 +112,41 @@ class NetworkDetachRequest(BaseModel):
     host_id: str
     vm_id: str
 
+
+
+
+class ImageCreateRequest(BaseModel):
+    host_id: str
+    name: str
+    source_url: str
+
+
+class ImageRecord(BaseModel):
+    image_id: str
+    name: str
+    source_url: str
+    status: str
+    created_at: str
+
+
+
+class PolicyCreateRequest(BaseModel):
+    name: str
+    category: str = "governance"
+    spec: dict[str, str] = Field(default_factory=dict)
+
+
+class PolicyRecord(BaseModel):
+    policy_id: str
+    name: str
+    category: str
+    spec: dict[str, str]
+    created_at: str
+
+
+class PolicyBindingRequest(BaseModel):
+    host_id: str | None = None
+    project_id: str | None = None
 
 class ProjectCreateRequest(BaseModel):
     name: str
