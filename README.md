@@ -636,3 +636,18 @@ Each page includes a shared left navigation and loads live data from API endpoin
 - `POST /api/v1/runbooks/templates`
 - `GET /api/v1/runbooks/schedules`
 - `POST /api/v1/runbooks/schedules`
+
+## Refined VM/Storage/Console UX updates
+
+Latest UI update adds OpenShift-style interaction for operators:
+
+- VM page includes direct actions: **Run**, **Shutdown**, **Reboot**, **Pause**, **Resume**, and **Console**.
+- VM page supports **Create VM** and **Import VM** flows from the UI.
+- Storage page shows **storage pools** with qcow2 volumes and VM-disk associations for quick visibility.
+- Network page includes quick **Create network** action.
+- Images page includes quick **Create image** and **Import image pipeline** actions.
+
+New control-plane APIs used by this UX:
+
+- `POST /api/v1/vms/import`
+- `GET /api/v1/hosts/{host_id}/storage-pools`

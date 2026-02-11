@@ -51,6 +51,20 @@ class VMHostActionRequest(BaseModel):
     action: VMAction
 
 
+class VMImportRequest(BaseModel):
+    host_id: str
+    vm_id: str
+    name: str
+    cpu_cores: int
+    memory_mb: int
+    image: str
+    power_state: str = "stopped"
+    networks: list[str] = Field(default_factory=list)
+    labels: dict[str, str] = Field(default_factory=dict)
+    annotations: dict[str, str] = Field(default_factory=dict)
+    created_at: str
+
+
 class VMResizeRequest(BaseModel):
     host_id: str
     cpu_cores: int

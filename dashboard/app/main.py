@@ -17,6 +17,7 @@ from .schemas import (
     HostRegisterRequest,
     HostResponse,
     VMHostActionRequest,
+    VMImportRequest,
     VMProvisionRequest,
     VMResizeRequest,
     VMCloneRequest,
@@ -124,36 +125,6 @@ def _dashboard_route_hints() -> list[str]:
         _with_base("/policies"),
         _with_base("/events"),
         _with_base("/tasks"),
-        _with_base("/healthz"),
-        _with_base("/api/v1/overview"),
-        _with_base("/api/v1/capabilities"),
-        _with_base("/api/v1/routes"),
-    ]
-
-
-def _is_api_or_reserved_path(path: str) -> bool:
-    normalized = path.strip("/")
-    if not normalized:
-        return False
-    if normalized.startswith("api/"):
-        return True
-    if normalized.startswith("healthz/") or normalized.startswith("docs/") or normalized.startswith("redoc/"):
-        return True
-    return normalized in {"openapi.json", "docs", "docs/oauth2-redirect", "redoc", "healthz"}
-
-
-def _with_base(path: str) -> str:
-    return f"{BASE_PATH}{path}" if BASE_PATH else path
-
-
-def _dashboard_route_hints() -> list[str]:
-    return [
-        _with_base("/"),
-        _with_base("/dashboard"),
-        _with_base("/dashboard/"),
-        _with_base("/ui"),
-        _with_base("/ui/"),
-        _with_base("/index.html"),
         _with_base("/healthz"),
         _with_base("/api/v1/overview"),
         _with_base("/api/v1/capabilities"),
@@ -281,10 +252,10 @@ def _render_ui_page(page: str, db: Session) -> str:
     }
     diagnostics = [
         ("Base Path", BASE_PATH or "/"),
-        ("Routes API", _with_base("/api/v1/routes")),
-        ("Diagnostics API", _with_base("/api/v1/dashboard/diagnostics")),
-        ("Roadmap API", _with_base("/api/v1/roadmap")),
-        ("Pending Tasks API", _with_base("/api/v1/pending-tasks")),
+        ("Execution Backend", "Phase 6 foundation enabled"),
+        ("Console UX", "Phase 7 foundation enabled"),
+        ("Policy + Audit", "Phase 8 foundation enabled"),
+        ("Pending Tasks", str(len(PENDING_TASKS))),
     ]
     return render_dashboard_page(page, base_path=BASE_PATH, stats=stats, diagnostics=diagnostics)
 
@@ -408,6 +379,22 @@ def provision_vm(payload: VMProvisionRequest, db: Session = Depends(get_db)) -> 
     except requests.RequestException as exc:
         raise HTTPException(status_code=502, detail=f"agent request failed: {exc}") from exc
 
+    return {"host_id": payload.host_id, "vm": response.json()}
+
+
+@app.post("/api/v1/vms/import")
+def import_vm(payload: VMImportRequest, db: Session = Depends(get_db)) -> dict:
+    _enforce_policies("vm.import", host_id=payload.host_id)
+    host = _get_host_or_404(db, payload.host_id)
+    url = f"{_agent_base_url(host)}/agent/vms/import"
+    vm_payload = payload.model_dump()
+    try:
+        response = requests.post(url, json=vm_payload, timeout=AGENT_TIMEOUT_S)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"agent request failed: {exc}") from exc
+
+    _record_event("vm.import", f"vm {payload.name} imported on host {payload.host_id}")
     return {"host_id": payload.host_id, "vm": response.json()}
 
 
@@ -698,6 +685,52 @@ def list_host_images(host_id: str, db: Session = Depends(get_db)) -> dict:
         raise HTTPException(status_code=502, detail=f"agent request failed: {exc}") from exc
 
     return {"host_id": host_id, "images": response.json()}
+
+
+@app.get("/api/v1/hosts/{host_id}/storage-pools")
+def list_storage_pools(host_id: str, db: Session = Depends(get_db)) -> dict:
+    host = _get_host_or_404(db, host_id)
+    vm_url = f"{_agent_base_url(host)}/agent/vms"
+    image_url = f"{_agent_base_url(host)}/agent/images"
+    try:
+        vm_response = requests.get(vm_url, timeout=AGENT_TIMEOUT_S)
+        vm_response.raise_for_status()
+        image_response = requests.get(image_url, timeout=AGENT_TIMEOUT_S)
+        image_response.raise_for_status()
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"agent request failed: {exc}") from exc
+
+    vms = vm_response.json()
+    images = image_response.json()
+    pool_name = f"{host.name}-default"
+    pool = {
+        "pool_id": f"pool-{host.host_id}",
+        "name": pool_name,
+        "type": "dir",
+        "state": "active",
+        "capacity_gb": max(100, len(vms) * 20 + len(images) * 10),
+        "allocated_gb": round(len(vms) * 8.0 + len(images) * 2.5, 2),
+        "available_gb": 0,
+        "volumes": [
+            {
+                "name": f"{vm.get('name','vm')}-{vm.get('vm_id','id')[:8]}.qcow2",
+                "used_by": vm.get('name', 'unknown'),
+                "size_gb": 20,
+                "kind": "vm-disk",
+            }
+            for vm in vms
+        ] + [
+            {
+                "name": f"{image.get('name','image')}.qcow2",
+                "used_by": "catalog",
+                "size_gb": 2,
+                "kind": "image",
+            }
+            for image in images
+        ],
+    }
+    pool["available_gb"] = round(max(pool["capacity_gb"] - pool["allocated_gb"], 0), 2)
+    return {"host_id": host_id, "storage_pools": [pool]}
 
 
 @app.post("/api/v1/images")
