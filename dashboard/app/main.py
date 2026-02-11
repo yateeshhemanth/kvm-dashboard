@@ -142,6 +142,36 @@ def _is_api_or_reserved_path(path: str) -> bool:
     return normalized in {"openapi.json", "docs", "docs/oauth2-redirect", "redoc", "healthz"}
 
 
+def _with_base(path: str) -> str:
+    return f"{BASE_PATH}{path}" if BASE_PATH else path
+
+
+def _dashboard_route_hints() -> list[str]:
+    return [
+        _with_base("/"),
+        _with_base("/dashboard"),
+        _with_base("/dashboard/"),
+        _with_base("/ui"),
+        _with_base("/ui/"),
+        _with_base("/index.html"),
+        _with_base("/healthz"),
+        _with_base("/api/v1/overview"),
+        _with_base("/api/v1/capabilities"),
+        _with_base("/api/v1/routes"),
+    ]
+
+
+def _is_api_or_reserved_path(path: str) -> bool:
+    normalized = path.strip("/")
+    if not normalized:
+        return False
+    if normalized.startswith("api/"):
+        return True
+    if normalized.startswith("healthz/") or normalized.startswith("docs/") or normalized.startswith("redoc/"):
+        return True
+    return normalized in {"openapi.json", "docs", "docs/oauth2-redirect", "redoc", "healthz"}
+
+
 def _record_event(event_type: str, message: str) -> EventRecord:
     event = EventRecord(
         event_id=str(uuid4()),
