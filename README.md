@@ -37,7 +37,15 @@ The goal is to give you a clean base to build a full OpenShift-inspired operatio
 ```text
 .
 ├── agent/
-│   ├── agent.py
+│   ├── agent.py                  # compatibility entrypoint for uvicorn
+│   ├── app/
+│   │   ├── __init__.py
+│   │   ├── config.py             # environment + host configuration loading
+│   │   ├── main.py               # FastAPI app wiring + lifecycle hooks
+│   │   ├── routes.py             # API endpoints for VM/network operations
+│   │   ├── schemas.py            # pydantic request/response models
+│   │   ├── services.py           # heartbeat + dashboard sync logic
+│   │   └── state.py              # shared in-memory state container
 │   ├── Dockerfile
 │   └── requirements.txt
 ├── dashboard/
@@ -51,6 +59,15 @@ The goal is to give you a clean base to build a full OpenShift-inspired operatio
 ├── docker-compose.yml
 └── README.md
 ```
+
+## Dashboard ↔ Agent linking model
+
+- `dashboard` keeps source-of-truth host inventory in SQLite and exposes central APIs.
+- `agent` auto-registers and sends heartbeat updates to dashboard using `DASHBOARD_URL`.
+- Dashboard calls host-agent APIs (`/agent/vms`, `/agent/networks`, snapshots) using host address + port `9090`.
+- This split lets you troubleshoot either side independently:
+  - Agent-side logic and state issues: inspect `agent/app/routes.py`, `agent/app/services.py`, and `/agent/status`.
+  - Control-plane orchestration issues: inspect `dashboard/app/main.py` and `/api/v1/events`.
 
 ---
 
@@ -152,6 +169,7 @@ curl -X POST http://127.0.0.1:9090/agent/push-now
   - delete VM
   - create/list/delete host networks
   - attach network to VM
+  - create/list/delete qcow2 image records per host
 
 ### 🚧 Not implemented yet (next phases)
 - Live migration and advanced VM lifecycle policies
@@ -167,6 +185,8 @@ curl -X POST http://127.0.0.1:9090/agent/push-now
 - VM resize operation (`cpu_cores`, `memory_mb`)
 - VM migration workflow across hosts via dashboard orchestration
 - VM snapshots lifecycle (`create`, `list`, `revert`, `delete`)
+- VM clone operation
+- VM metadata operations (labels + annotations)
 - Network detach operation (`detach network from VM`)
 
 
@@ -192,6 +212,25 @@ curl -X POST http://127.0.0.1:9090/agent/push-now
 - Runbook execution API for OpenShift-like day-2 automation trigger flows
 - Task tracking APIs (`list/get`) so operation results can be queried and audited
 - Dashboard render hardening for recent events section (pre-rendered event html)
+
+
+### ✅ Added in this phase (OpenShift-style policy controls)
+- Policies API (create/list)
+- Policy binding to hosts and projects
+- Effective policy resolution endpoint for troubleshooting
+- Capabilities discovery endpoint for UI/API clients
+
+### New APIs in this phase
+- `GET /api/v1/capabilities`
+- `GET /api/v1/routes`
+- `GET /api/v1/dashboard/diagnostics`
+- `POST /api/v1/policies`
+- `GET /api/v1/policies`
+- `POST /api/v1/policies/{policy_id}/bind-host`
+- `POST /api/v1/policies/{policy_id}/bind-project`
+- `GET /api/v1/policies/effective?host_id=<host-id>&project_id=<project-id>`
+- `GET /dashboard` (dashboard alias)
+- `GET /ui` (dashboard alias)
 
 ### New APIs in this phase
 - `POST /api/v1/projects/{project_id}/members`
@@ -486,3 +525,47 @@ curl http://127.0.0.1:8000/api/v1/backbone/check
 
 If `/healthz` fails, dashboard service is not running.
 If `/healthz` works but `/` still fails, ensure requests are sent to the dashboard port (not another local service) and that reverse proxy path forwarding includes `/`.
+
+- `POST /api/v1/vms/{vm_id}/clone`
+- `POST /api/v1/vms/{vm_id}/metadata`
+
+
+## Quick non-Docker validation (avoids Docker page-not-found confusion)
+
+Start dashboard directly:
+
+```bash
+uvicorn dashboard.app.main:app --host 0.0.0.0 --port 8000
+```
+
+Then verify routes:
+
+```bash
+curl http://127.0.0.1:8000/healthz
+curl http://127.0.0.1:8000/
+curl http://127.0.0.1:8000/dashboard
+curl http://127.0.0.1:8000/ui
+curl http://127.0.0.1:8000/index.html
+curl http://127.0.0.1:8000/home
+curl http://127.0.0.1:8000/api/v1/capabilities
+curl http://127.0.0.1:8000/api/v1/routes
+curl http://127.0.0.1:8000/api/v1/dashboard/diagnostics
+```
+
+
+## Base-path mode (for reverse proxies)
+
+If your ingress/proxy serves dashboard under a prefix (for example `/kvm`), set:
+
+```bash
+export DASHBOARD_BASE_PATH=/kvm
+uvicorn dashboard.app.main:app --host 0.0.0.0 --port 8000
+```
+
+Then both UI and API can be accessed with the prefix:
+
+```bash
+curl http://127.0.0.1:8000/kvm/dashboard
+curl http://127.0.0.1:8000/kvm/api/v1/routes
+curl http://127.0.0.1:8000/kvm/api/v1/dashboard/diagnostics
+```
