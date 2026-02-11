@@ -224,6 +224,8 @@ curl -X POST http://127.0.0.1:9090/agent/push-now
 - `GET /api/v1/capabilities`
 - `GET /api/v1/routes`
 - `GET /api/v1/dashboard/diagnostics`
+- `GET /api/v1/roadmap`
+- `GET /api/v1/pending-tasks`
 - `POST /api/v1/policies`
 - `GET /api/v1/policies`
 - `POST /api/v1/policies/{policy_id}/bind-host`
@@ -569,3 +571,68 @@ curl http://127.0.0.1:8000/kvm/dashboard
 curl http://127.0.0.1:8000/kvm/api/v1/routes
 curl http://127.0.0.1:8000/kvm/api/v1/dashboard/diagnostics
 ```
+
+
+## Next phase plan (explicit)
+
+### Phase 6 - Execution Backend (next)
+- Integrate libvirt-backed VM lifecycle execution in host-agent
+- Implement real host network backend operations (bridge/VLAN)
+- Build qcow2 image import pipeline with checksum verification
+
+### Phase 7 - Console + UX
+- Replace noVNC placeholder with real tokenized console proxy path
+- Add task retry and event filtering in dashboard
+- Add project-scoped health views
+
+### Phase 8 - Policy Enforcement
+- Enforce policy checks before VM/network operations
+- Add audit export and event retention controls
+- Add scheduled runbooks and reusable templates
+
+## Pending tasks (tracked in API)
+Use:
+
+```bash
+curl http://127.0.0.1:8000/api/v1/roadmap
+curl http://127.0.0.1:8000/api/v1/pending-tasks
+```
+
+## Multi-page dashboard navigation (new)
+
+The dashboard UI is now split into navigable pages similar to OpenShift console sections:
+
+- `/dashboard` - overview
+- `/vms` - VM inventory view
+- `/storage` - storage/image import jobs
+- `/console` - console session view
+- `/networks` - network inventory view
+- `/images` - image catalog view
+- `/projects` - project list view
+- `/policies` - policy list view
+- `/events` - event timeline view
+- `/tasks` - task history view
+
+Each page includes a shared left navigation and loads live data from API endpoints.
+
+## Phase 6, 7, 8 implementation foundations (new)
+
+### Phase 6 - Execution Backend foundations
+- `GET /api/v1/phase6/execution`
+- `POST /api/v1/images/import`
+- `GET /api/v1/images/import-jobs`
+
+### Phase 7 - Console + UX foundations
+- `GET /api/v1/console/sessions`
+- `POST /api/v1/tasks/{task_id}/retry`
+- Enhanced `GET /api/v1/events` filters: `event_type`, `since`
+
+### Phase 8 - Policy + audit foundations
+- Policy enforcement hook for selected mutating actions (VM provision/action, network create, image create)
+- `GET /api/v1/audit/export`
+- `GET /api/v1/events/retention`
+- `POST /api/v1/events/retention?days=<n>`
+- `GET /api/v1/runbooks/templates`
+- `POST /api/v1/runbooks/templates`
+- `GET /api/v1/runbooks/schedules`
+- `POST /api/v1/runbooks/schedules`
