@@ -57,6 +57,17 @@ class VMResizeRequest(BaseModel):
     memory_mb: int
 
 
+class VMCloneRequest(BaseModel):
+    host_id: str
+    name: str
+
+
+class VMMetadataRequest(BaseModel):
+    host_id: str
+    labels: dict[str, str] = Field(default_factory=dict)
+    annotations: dict[str, str] = Field(default_factory=dict)
+
+
 class VMMigrateRequest(BaseModel):
     source_host_id: str
     target_host_id: str
@@ -87,6 +98,41 @@ class NetworkDetachRequest(BaseModel):
     host_id: str
     vm_id: str
 
+
+
+
+class ImageCreateRequest(BaseModel):
+    host_id: str
+    name: str
+    source_url: str
+
+
+class ImageRecord(BaseModel):
+    image_id: str
+    name: str
+    source_url: str
+    status: str
+    created_at: str
+
+
+
+class PolicyCreateRequest(BaseModel):
+    name: str
+    category: str = "governance"
+    spec: dict[str, str] = Field(default_factory=dict)
+
+
+class PolicyRecord(BaseModel):
+    policy_id: str
+    name: str
+    category: str
+    spec: dict[str, str]
+    created_at: str
+
+
+class PolicyBindingRequest(BaseModel):
+    host_id: str | None = None
+    project_id: str | None = None
 
 class ProjectCreateRequest(BaseModel):
     name: str

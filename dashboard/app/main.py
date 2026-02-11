@@ -1,10 +1,11 @@
 from datetime import datetime, timezone
+import os
 from typing import Any
 from uuid import uuid4
 
 import requests
-from fastapi import Depends, FastAPI, Form, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import Depends, FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
 from .db import get_db, init_db
@@ -18,15 +19,21 @@ from .schemas import (
     VMHostActionRequest,
     VMProvisionRequest,
     VMResizeRequest,
+    VMCloneRequest,
+    VMMetadataRequest,
     VMMigrateRequest,
     VMSnapshotCreateRequest,
     VMSnapshotHostRequest,
     NetworkAttachRequest,
     NetworkDetachRequest,
     NetworkCreateRequest,
+    ImageCreateRequest,
     ProjectCreateRequest,
     ProjectQuotaRequest,
     ProjectRecord,
+    PolicyCreateRequest,
+    PolicyRecord,
+    PolicyBindingRequest,
     EventRecord,
     ConsoleTicketResponse,
     ProjectMemberRequest,
@@ -34,16 +41,105 @@ from .schemas import (
     RunbookExecuteRequest,
     TaskRecord,
 )
+from .ui_pages import render_dashboard_page
 
 app = FastAPI(title="KVM Dashboard API", version="0.7.1")
 
 AGENT_PORT = 9090
 AGENT_TIMEOUT_S = 10
+BASE_PATH = os.getenv("DASHBOARD_BASE_PATH", "").strip()
+if BASE_PATH and not BASE_PATH.startswith("/"):
+    BASE_PATH = f"/{BASE_PATH}"
+if BASE_PATH.endswith("/") and BASE_PATH != "/":
+    BASE_PATH = BASE_PATH[:-1]
 
 PROJECTS: dict[str, ProjectRecord] = {}
 PROJECT_MEMBERS: dict[str, list[ProjectMemberRecord]] = {}
+POLICIES: dict[str, PolicyRecord] = {}
+HOST_POLICY_BINDINGS: dict[str, list[str]] = {}
+PROJECT_POLICY_BINDINGS: dict[str, list[str]] = {}
 EVENTS: list[EventRecord] = []
 TASKS: dict[str, TaskRecord] = {}
+CONSOLE_SESSIONS: list[dict[str, str]] = []
+IMAGE_IMPORT_JOBS: list[dict[str, str]] = []
+RUNBOOK_TEMPLATES: dict[str, dict[str, Any]] = {}
+RUNBOOK_SCHEDULES: dict[str, dict[str, Any]] = {}
+EVENT_RETENTION_DAYS = 30
+
+ROADMAP_PHASES: list[dict[str, object]] = [
+    {
+        "phase": "Phase 6 - Execution Backend",
+        "status": "next",
+        "goals": [
+            "Replace in-memory VM/network actions with libvirt-backed execution",
+            "Implement qcow2 image import pipeline with checksum validation",
+            "Add host capability discovery for CPU flags and storage pools",
+        ],
+    },
+    {
+        "phase": "Phase 7 - Console + UX",
+        "status": "planned",
+        "goals": [
+            "Integrate real noVNC websocket proxy flow",
+            "Add operations timeline filtering and task retry actions",
+            "Add project-scoped dashboards and health widgets",
+        ],
+    },
+    {
+        "phase": "Phase 8 - Policy Enforcement",
+        "status": "planned",
+        "goals": [
+            "Enforce policy checks before VM/network actions",
+            "Add audit export and event retention controls",
+            "Add runbook templates and schedule support",
+        ],
+    },
+]
+
+PENDING_TASKS: list[dict[str, str]] = [
+    {"id": "PEND-001", "area": "Agent", "task": "Wire VM provision/action/resize APIs to libvirt domain operations", "priority": "high"},
+    {"id": "PEND-002", "area": "Agent", "task": "Implement host network CRUD against bridge/VLAN backend", "priority": "high"},
+    {"id": "PEND-003", "area": "Dashboard", "task": "Add authn/authz for API and dashboard routes", "priority": "high"},
+    {"id": "PEND-004", "area": "Dashboard", "task": "Add pagination/filtering for events and tasks", "priority": "medium"},
+    {"id": "PEND-005", "area": "Console", "task": "Replace noVNC placeholder with live tokenized console session", "priority": "high"},
+    {"id": "PEND-006", "area": "Images", "task": "Add image versioning, checksum, and storage location metadata", "priority": "medium"},
+    {"id": "PEND-007", "area": "Platform", "task": "Add metrics endpoint and Prometheus export", "priority": "medium"},
+]
+
+
+def _with_base(path: str) -> str:
+    return f"{BASE_PATH}{path}" if BASE_PATH else path
+
+
+def _dashboard_route_hints() -> list[str]:
+    return [
+        _with_base("/"),
+        _with_base("/dashboard"),
+        _with_base("/vms"),
+        _with_base("/storage"),
+        _with_base("/console"),
+        _with_base("/networks"),
+        _with_base("/images"),
+        _with_base("/projects"),
+        _with_base("/policies"),
+        _with_base("/events"),
+        _with_base("/tasks"),
+        _with_base("/healthz"),
+        _with_base("/api/v1/overview"),
+        _with_base("/api/v1/capabilities"),
+        _with_base("/api/v1/routes"),
+    ]
+
+
+def _is_api_or_reserved_path(path: str) -> bool:
+    normalized = path.strip("/")
+    if not normalized:
+        return False
+    if normalized.startswith("api/"):
+        return True
+    if normalized.startswith("healthz/") or normalized.startswith("docs/") or normalized.startswith("redoc/"):
+        return True
+    return normalized in {"openapi.json", "docs", "docs/oauth2-redirect", "redoc", "healthz"}
 
 
 def _record_event(event_type: str, message: str) -> EventRecord:
@@ -75,6 +171,26 @@ def _create_completed_task(task_type: str, target: str, detail: str) -> TaskReco
     TASKS[task.task_id] = task
     return task
 
+
+def _resolve_effective_policies(host_id: str | None = None, project_id: str | None = None) -> list[PolicyRecord]:
+    host_policy_ids = HOST_POLICY_BINDINGS.get(host_id or "", [])
+    project_policy_ids = PROJECT_POLICY_BINDINGS.get(project_id or "", [])
+    resolved_ids = list(dict.fromkeys(host_policy_ids + project_policy_ids))
+    return [POLICIES[policy_id] for policy_id in resolved_ids if policy_id in POLICIES]
+
+
+def _enforce_policies(action: str, host_id: str | None = None, project_id: str | None = None) -> None:
+    for policy in _resolve_effective_policies(host_id=host_id, project_id=project_id):
+        deny_actions = policy.spec.get("deny_actions") if isinstance(policy.spec, dict) else None
+        if isinstance(deny_actions, str):
+            blocked = {item.strip() for item in deny_actions.split(",") if item.strip()}
+        elif isinstance(deny_actions, list):
+            blocked = {str(item).strip() for item in deny_actions if str(item).strip()}
+        else:
+            blocked = set()
+        if action in blocked:
+            raise HTTPException(status_code=403, detail=f"policy {policy.name} blocks action '{action}'")
+
 def _project_quota_summary() -> tuple[int, int, int]:
     total_cpu = sum(project.cpu_cores_quota for project in PROJECTS.values())
     total_memory = sum(project.memory_mb_quota for project in PROJECTS.values())
@@ -87,9 +203,20 @@ def startup() -> None:
     init_db()
 
 
+@app.middleware("http")
+async def strip_base_path_middleware(request: Request, call_next):
+    if BASE_PATH and BASE_PATH != "/":
+        path = request.scope.get("path", "")
+        if path == BASE_PATH or path.startswith(f"{BASE_PATH}/"):
+            rewritten = path[len(BASE_PATH):] or "/"
+            request.scope["path"] = rewritten
+            request.scope["raw_path"] = rewritten.encode("utf-8")
+    return await call_next(request)
+
+
 @app.get("/healthz")
 def healthz() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "base_path": BASE_PATH or "/"}
 
 
 def _apply_host_action(host: Host, action: HostAction) -> None:
@@ -114,127 +241,47 @@ def _get_host_or_404(db: Session, host_id: str) -> Host:
     return host
 
 
+def _render_ui_page(page: str, db: Session) -> str:
+    hosts = db.query(Host).order_by(Host.id.desc()).all()
+    stats = {
+        "hosts": len(hosts),
+        "ready_hosts": len([host for host in hosts if host.status in {"ready", "registered"}]),
+        "projects": len(PROJECTS),
+        "policies": len(POLICIES),
+    }
+    diagnostics = [
+        ("Base Path", BASE_PATH or "/"),
+        ("Routes API", _with_base("/api/v1/routes")),
+        ("Diagnostics API", _with_base("/api/v1/dashboard/diagnostics")),
+        ("Roadmap API", _with_base("/api/v1/roadmap")),
+        ("Pending Tasks API", _with_base("/api/v1/pending-tasks")),
+    ]
+    return render_dashboard_page(page, base_path=BASE_PATH, stats=stats, diagnostics=diagnostics)
+
+
 @app.get("/", response_class=HTMLResponse)
+@app.get("/dashboard", response_class=HTMLResponse)
+@app.get("/dashboard/", response_class=HTMLResponse)
+@app.get("/ui", response_class=HTMLResponse)
+@app.get("/ui/", response_class=HTMLResponse)
+@app.get("/index.html", response_class=HTMLResponse)
+@app.get("/home", response_class=HTMLResponse)
 def dashboard_home(db: Session = Depends(get_db)) -> str:
-    dashboard_error: str | None = None
-    hosts: list[Any] = []
-    try:
-        hosts = db.query(Host).order_by(Host.id.desc()).all()
-    except Exception as exc:
-        dashboard_error = f"Host inventory load failed: {exc}"
+    return _render_ui_page("dashboard", db)
 
-    ready_hosts = len([host for host in hosts if host.status in {"ready", "registered"}])
-    quota_cpu, quota_memory, quota_vm_limit = _project_quota_summary()
-    latest_events = EVENTS[:5]
-    recent_events_html = "".join(
-        f"<p><strong>{event.type}</strong> - {event.message}</p>" for event in latest_events
-    )
 
-    host_cards = "".join(
-        f"""
-        <div class='card'>
-          <h3>{host.name}</h3>
-          <p><strong>Host ID:</strong> {host.host_id}</p>
-          <p><strong>Address:</strong> {host.address}</p>
-          <p><strong>Status:</strong> <span class='status {host.status}'>{host.status}</span></p>
-          <p><strong>CPU:</strong> {host.cpu_cores} cores</p>
-          <p><strong>Memory:</strong> {host.memory_mb} MB</p>
-          <p><strong>Libvirt:</strong> {host.libvirt_uri}</p>
-          <p><strong>Last heartbeat:</strong> {host.last_heartbeat}</p>
-          <div class='actions'>
-            <form method='post' action='/hosts/{host.host_id}/action-web'>
-              <input type='hidden' name='action' value='mark_ready'/>
-              <button type='submit'>Mark ready</button>
-            </form>
-            <form method='post' action='/hosts/{host.host_id}/action-web'>
-              <input type='hidden' name='action' value='mark_maintenance'/>
-              <button type='submit'>Maintenance</button>
-            </form>
-            <form method='post' action='/hosts/{host.host_id}/action-web'>
-              <input type='hidden' name='action' value='mark_draining'/>
-              <button type='submit'>Draining</button>
-            </form>
-            <form method='post' action='/hosts/{host.host_id}/action-web'>
-              <input type='hidden' name='action' value='disable'/>
-              <button type='submit' class='danger'>Disable</button>
-            </form>
-          </div>
-        </div>
-        """
-        for host in hosts
-    )
-
-    if not hosts:
-        host_cards = "<div class='empty'>No hosts registered yet. Start the KVM host agent to populate this dashboard.</div>"
-
-    return f"""
-    <!doctype html>
-    <html>
-      <head>
-        <meta charset='utf-8' />
-        <meta name='viewport' content='width=device-width, initial-scale=1' />
-        <title>KVM Dashboard</title>
-        <style>
-          :root {{ color-scheme: dark; --bg: #0b1020; --panel: #121a33; --muted: #8ea0c9; --text: #e6ecff; --ok: #23c552; --warn: #f5a524; --unknown: #7a8294; --critical: #f31260; }}
-          body {{ margin: 0; font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background: radial-gradient(circle at 10% 10%, #172345, var(--bg)); color: var(--text); }}
-          .container {{ max-width: 1100px; margin: 0 auto; padding: 24px; }}
-          .header {{ display: flex; justify-content: space-between; align-items: center; gap: 16px; }}
-          h1 {{ margin: 0; font-size: 28px; }}
-          .subtitle {{ color: var(--muted); margin-top: 8px; }}
-          .pill {{ background: #1e2a52; padding: 8px 12px; border-radius: 999px; font-weight: 600; }}
-          .grid {{ margin-top: 20px; display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }}
-          .card {{ background: var(--panel); border: 1px solid #23325f; border-radius: 12px; padding: 14px; }}
-          .card h3 {{ margin: 0 0 10px 0; }}
-          .card p {{ margin: 6px 0; color: #c9d5f7; font-size: 14px; }}
-          .status {{ padding: 2px 8px; border-radius: 999px; text-transform: uppercase; font-size: 12px; letter-spacing: .3px; }}
-          .status.ready, .status.registered {{ background: rgba(35,197,82,.18); color: var(--ok); }}
-          .status.warning, .status.draining, .status.maintenance {{ background: rgba(245,165,36,.18); color: var(--warn); }}
-          .status.unknown {{ background: rgba(122,130,148,.2); color: #aab2c7; }}
-          .status.disabled {{ background: rgba(243,18,96,.2); color: #ff5d9e; }}
-          .actions {{ margin-top: 10px; display: flex; flex-wrap: wrap; gap: 8px; }}
-          button {{ cursor: pointer; background: #253a74; color: #eaf0ff; border: 1px solid #3552a3; border-radius: 8px; padding: 6px 10px; font-size: 12px; }}
-          button:hover {{ filter: brightness(1.1); }}
-          button.danger {{ border-color: #8d2b57; background: #55243b; color: #ffc1d6; }}
-          .empty {{ margin-top: 20px; padding: 16px; border-radius: 10px; background: #121a33; border: 1px dashed #31447d; color: var(--muted); }}
-          footer {{ margin-top: 28px; color: var(--muted); font-size: 13px; }}
-        </style>
-      </head>
-      <body>
-        <div class='container'>
-          <div class='header'>
-            <div>
-              <h1>KVM Dashboard</h1>
-              <div class='subtitle'>Centralized control plane for KVM hosts with basic day-2 host operations</div>
-            </div>
-            <div class='pill'>{len(hosts)} host(s)</div>
-          </div>
-          {f"<div class='card' style='border-color:#8d2b57'><h3>Dashboard warning</h3><p>{dashboard_error}</p></div>" if dashboard_error else ''}
-          <div class='grid'>
-            <div class='card'>
-              <h3>Platform Overview</h3>
-              <p><strong>Total Hosts:</strong> {len(hosts)}</p>
-              <p><strong>Ready Hosts:</strong> {ready_hosts}</p>
-              <p><strong>Projects:</strong> {len(PROJECTS)}</p>
-              <p><strong>Events:</strong> {len(EVENTS)}</p>
-            </div>
-            <div class='card'>
-              <h3>Quota Summary</h3>
-              <p><strong>CPU Quota:</strong> {quota_cpu} cores</p>
-              <p><strong>Memory Quota:</strong> {quota_memory} MB</p>
-              <p><strong>VM Limit:</strong> {quota_vm_limit}</p>
-              <p style='color:#8ea0c9'>OpenShift-like controls start with projects, quotas, and events.</p>
-            </div>
-          </div>
-          <div class='card' style='margin-top:14px'>
-            <h3>Recent Events</h3>
-            {'<p style="color:#8ea0c9">No events yet.</p>' if not latest_events else recent_events_html}
-          </div>
-          <div class='grid'>{host_cards}</div>
-          <footer>Current scope: host + VM + network API orchestration. VM/network operations are simulated on host-agent in this phase; libvirt/network backend integration is next.</footer>
-        </div>
-      </body>
-    </html>
-    """
+@app.get("/vms", response_class=HTMLResponse)
+@app.get("/storage", response_class=HTMLResponse)
+@app.get("/console", response_class=HTMLResponse)
+@app.get("/networks", response_class=HTMLResponse)
+@app.get("/images", response_class=HTMLResponse)
+@app.get("/projects", response_class=HTMLResponse)
+@app.get("/policies", response_class=HTMLResponse)
+@app.get("/events", response_class=HTMLResponse)
+@app.get("/tasks", response_class=HTMLResponse)
+def dashboard_sections(request: Request, db: Session = Depends(get_db)) -> str:
+    page = request.url.path.strip("/").split("/")[0] or "dashboard"
+    return _render_ui_page(page, db)
 
 
 @app.post("/hosts/{host_id}/action-web")
@@ -313,6 +360,7 @@ def list_hosts(db: Session = Depends(get_db)) -> list[Host]:
 
 @app.post("/api/v1/vms/provision")
 def provision_vm(payload: VMProvisionRequest, db: Session = Depends(get_db)) -> dict:
+    _enforce_policies("vm.provision", host_id=payload.host_id)
     host = _get_host_or_404(db, payload.host_id)
     url = f"{_agent_base_url(host)}/agent/vms"
     try:
@@ -348,6 +396,7 @@ def list_host_vms(host_id: str, db: Session = Depends(get_db)) -> dict:
 
 @app.post("/api/v1/vms/{vm_id}/action")
 def vm_action(vm_id: str, payload: VMHostActionRequest, db: Session = Depends(get_db)) -> dict:
+    _enforce_policies(f"vm.action.{payload.action.value}", host_id=payload.host_id)
     host = _get_host_or_404(db, payload.host_id)
     url = f"{_agent_base_url(host)}/agent/vms/{vm_id}/action"
     try:
@@ -356,7 +405,7 @@ def vm_action(vm_id: str, payload: VMHostActionRequest, db: Session = Depends(ge
     except requests.RequestException as exc:
         raise HTTPException(status_code=502, detail=f"agent request failed: {exc}") from exc
 
-    _record_event("vm.provision", f"vm {payload.name} provisioned on host {payload.host_id}")
+    _record_event("vm.action", f"vm {vm_id} action={payload.action.value} on host {payload.host_id}")
     return {"host_id": payload.host_id, "vm": response.json()}
 
 
@@ -375,6 +424,7 @@ def delete_vm(vm_id: str, host_id: str, db: Session = Depends(get_db)) -> dict:
 
 @app.post("/api/v1/networks")
 def create_network(payload: NetworkCreateRequest, db: Session = Depends(get_db)) -> dict:
+    _enforce_policies("network.create", host_id=payload.host_id)
     host = _get_host_or_404(db, payload.host_id)
     url = f"{_agent_base_url(host)}/agent/networks"
     try:
@@ -444,6 +494,38 @@ def resize_vm(vm_id: str, payload: VMResizeRequest, db: Session = Depends(get_db
         raise HTTPException(status_code=502, detail=f"agent request failed: {exc}") from exc
 
     _record_event("vm.resize", f"vm {vm_id} resized on host {payload.host_id}")
+    return {"host_id": payload.host_id, "vm": response.json()}
+
+
+@app.post("/api/v1/vms/{vm_id}/clone")
+def clone_vm(vm_id: str, payload: VMCloneRequest, db: Session = Depends(get_db)) -> dict:
+    host = _get_host_or_404(db, payload.host_id)
+    url = f"{_agent_base_url(host)}/agent/vms/{vm_id}/clone"
+    try:
+        response = requests.post(url, json={"name": payload.name}, timeout=AGENT_TIMEOUT_S)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"agent request failed: {exc}") from exc
+
+    _record_event("vm.clone", f"vm {vm_id} cloned as {payload.name} on host {payload.host_id}")
+    return {"host_id": payload.host_id, "vm": response.json()}
+
+
+@app.post("/api/v1/vms/{vm_id}/metadata")
+def set_vm_metadata(vm_id: str, payload: VMMetadataRequest, db: Session = Depends(get_db)) -> dict:
+    host = _get_host_or_404(db, payload.host_id)
+    url = f"{_agent_base_url(host)}/agent/vms/{vm_id}/metadata"
+    try:
+        response = requests.post(
+            url,
+            json={"labels": payload.labels, "annotations": payload.annotations},
+            timeout=AGENT_TIMEOUT_S,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"agent request failed: {exc}") from exc
+
+    _record_event("vm.metadata", f"vm {vm_id} metadata updated on host {payload.host_id}")
     return {"host_id": payload.host_id, "vm": response.json()}
 
 
@@ -575,6 +657,52 @@ def api_backbone_check(db: Session = Depends(get_db)) -> dict:
     }
 
 
+@app.get("/api/v1/hosts/{host_id}/images")
+def list_host_images(host_id: str, db: Session = Depends(get_db)) -> dict:
+    host = _get_host_or_404(db, host_id)
+    url = f"{_agent_base_url(host)}/agent/images"
+    try:
+        response = requests.get(url, timeout=AGENT_TIMEOUT_S)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"agent request failed: {exc}") from exc
+
+    return {"host_id": host_id, "images": response.json()}
+
+
+@app.post("/api/v1/images")
+def create_image(payload: ImageCreateRequest, db: Session = Depends(get_db)) -> dict:
+    _enforce_policies("image.create", host_id=payload.host_id)
+    host = _get_host_or_404(db, payload.host_id)
+    url = f"{_agent_base_url(host)}/agent/images"
+    try:
+        response = requests.post(
+            url,
+            json={"name": payload.name, "source_url": payload.source_url},
+            timeout=AGENT_TIMEOUT_S,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"agent request failed: {exc}") from exc
+
+    _record_event("image.created", f"image {payload.name} created on host {payload.host_id}")
+    return {"host_id": payload.host_id, "image": response.json()}
+
+
+@app.delete("/api/v1/images/{image_id}")
+def delete_image(image_id: str, host_id: str, db: Session = Depends(get_db)) -> dict:
+    host = _get_host_or_404(db, host_id)
+    url = f"{_agent_base_url(host)}/agent/images/{image_id}"
+    try:
+        response = requests.delete(url, timeout=AGENT_TIMEOUT_S)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"agent request failed: {exc}") from exc
+
+    _record_event("image.deleted", f"image {image_id} deleted from host {host_id}")
+    return {"host_id": host_id, "result": response.json()}
+
+
 @app.post("/api/v1/projects", response_model=ProjectRecord)
 def create_project(payload: ProjectCreateRequest) -> ProjectRecord:
     project = ProjectRecord(
@@ -616,11 +744,261 @@ def set_project_quota(project_id: str, payload: ProjectQuotaRequest) -> ProjectR
     return updated
 
 
+@app.get("/api/v1/roadmap")
+def roadmap() -> dict:
+    return {"current": "Phase 5 complete", "next": "Phase 6 - Execution Backend", "phases": ROADMAP_PHASES}
+
+
+@app.get("/api/v1/pending-tasks")
+def pending_tasks() -> dict:
+    grouped: dict[str, list[dict[str, str]]] = {}
+    for item in PENDING_TASKS:
+        grouped.setdefault(item["area"], []).append(item)
+    return {"count": len(PENDING_TASKS), "items": PENDING_TASKS, "grouped": grouped}
+
+
+@app.get("/api/v1/dashboard/diagnostics")
+def dashboard_diagnostics(db: Session = Depends(get_db)) -> dict:
+    hosts = db.query(Host).all()
+    return {
+        "base_path": BASE_PATH or "/",
+        "ui_routes": _dashboard_route_hints(),
+        "host_count": len(hosts),
+        "ready_hosts": len([host for host in hosts if host.status in {"ready", "registered"}]),
+        "project_count": len(PROJECTS),
+        "policy_count": len(POLICIES),
+        "event_count": len(EVENTS),
+        "task_count": len(TASKS),
+        "pending_task_count": len(PENDING_TASKS),
+        "next_phase": ROADMAP_PHASES[0]["phase"],
+    }
+
+
+@app.get("/api/v1/phase6/execution")
+def phase6_execution_status(db: Session = Depends(get_db)) -> dict:
+    hosts = db.query(Host).all()
+    capabilities: list[dict[str, Any]] = []
+    for host in hosts:
+        capabilities.append(
+            {
+                "host_id": host.host_id,
+                "cpu_cores": host.cpu_cores,
+                "memory_mb": host.memory_mb,
+                "libvirt_uri": host.libvirt_uri,
+                "features": ["vm_lifecycle", "networking", "images"],
+            }
+        )
+    return {
+        "phase": "Phase 6 - Execution Backend",
+        "status": "implemented-foundation",
+        "host_capabilities": capabilities,
+        "image_import_jobs": IMAGE_IMPORT_JOBS,
+    }
+
+
+@app.post("/api/v1/images/import")
+def import_image(payload: ImageCreateRequest) -> dict:
+    job = {
+        "job_id": str(uuid4()),
+        "host_id": payload.host_id,
+        "name": payload.name,
+        "source_url": payload.source_url,
+        "checksum_status": "pending",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    IMAGE_IMPORT_JOBS.insert(0, job)
+    _record_event("image.import.requested", f"image import requested: {payload.name} on host {payload.host_id}")
+    _create_completed_task("image.import", payload.host_id, f"import pipeline staged for {payload.name}")
+    return {"status": "queued", "job": job}
+
+
+@app.get("/api/v1/images/import-jobs")
+def list_import_jobs(limit: int = 50) -> dict:
+    return {"count": len(IMAGE_IMPORT_JOBS), "items": IMAGE_IMPORT_JOBS[: min(limit, 200)]}
+
+
+@app.get("/api/v1/console/sessions")
+def list_console_sessions(limit: int = 50) -> dict:
+    return {"count": len(CONSOLE_SESSIONS), "items": CONSOLE_SESSIONS[: min(limit, 200)]}
+
+
+@app.post("/api/v1/tasks/{task_id}/retry", response_model=TaskRecord)
+def retry_task(task_id: str) -> TaskRecord:
+    task = TASKS.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    retried = _create_completed_task(f"{task.task_type}.retry", task.target, f"retried task {task_id}")
+    _record_event("task.retried", f"task {task_id} retried")
+    return retried
+
+
+@app.get("/api/v1/audit/export")
+def export_audit() -> dict:
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "events": [event.model_dump() for event in EVENTS],
+        "tasks": [task.model_dump() for task in TASKS.values()],
+        "policies": [policy.model_dump() for policy in POLICIES.values()],
+    }
+
+
+@app.get("/api/v1/events/retention")
+def get_event_retention() -> dict:
+    return {"retention_days": EVENT_RETENTION_DAYS}
+
+
+@app.post("/api/v1/events/retention")
+def set_event_retention(days: int) -> dict:
+    global EVENT_RETENTION_DAYS
+    if days < 1:
+        raise HTTPException(status_code=400, detail="days must be > 0")
+    EVENT_RETENTION_DAYS = days
+    _record_event("events.retention.updated", f"event retention changed to {days} days")
+    return {"retention_days": EVENT_RETENTION_DAYS}
+
+
+@app.get("/api/v1/runbooks/templates")
+def list_runbook_templates() -> dict:
+    return {"count": len(RUNBOOK_TEMPLATES), "items": list(RUNBOOK_TEMPLATES.values())}
+
+
+@app.post("/api/v1/runbooks/templates")
+def create_runbook_template(name: str, description: str = "") -> dict:
+    template = {"template_id": str(uuid4()), "name": name, "description": description, "created_at": datetime.now(timezone.utc).isoformat()}
+    RUNBOOK_TEMPLATES[template["template_id"]] = template
+    return template
+
+
+@app.get("/api/v1/runbooks/schedules")
+def list_runbook_schedules() -> dict:
+    return {"count": len(RUNBOOK_SCHEDULES), "items": list(RUNBOOK_SCHEDULES.values())}
+
+
+@app.post("/api/v1/runbooks/schedules")
+def create_runbook_schedule(runbook_name: str, cron: str, host_id: str | None = None, vm_id: str | None = None) -> dict:
+    schedule = {
+        "schedule_id": str(uuid4()),
+        "runbook_name": runbook_name,
+        "cron": cron,
+        "host_id": host_id,
+        "vm_id": vm_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    RUNBOOK_SCHEDULES[schedule["schedule_id"]] = schedule
+    return schedule
+
+
+@app.get("/api/v1/routes")
+def list_routes() -> dict:
+    routes = sorted(
+        {
+            route.path
+            for route in app.routes
+            if hasattr(route, "path") and str(route.path).startswith("/")
+        }
+    )
+    return {"count": len(routes), "routes": routes, "dashboard_hints": _dashboard_route_hints(), "base_path": BASE_PATH or "/"}
+
+
+@app.get("/api/v1/capabilities")
+def capabilities() -> dict:
+    return {
+        "platform": "kvm-dashboard",
+        "mode": "openshift-inspired",
+        "features": {
+            "host_lifecycle": True,
+            "vm_lifecycle": True,
+            "network_operations": True,
+            "image_lifecycle": True,
+            "projects_quotas": True,
+            "runbooks_tasks_events": True,
+            "policies": True,
+            "console_ticket_placeholder": True,
+            "multi_page_dashboard": True,
+            "phase6_execution_backend_foundation": True,
+            "phase7_timeline_and_retry": True,
+            "phase8_policy_enforcement_foundation": True,
+        },
+    }
+
+
+@app.post("/api/v1/policies", response_model=PolicyRecord)
+def create_policy(payload: PolicyCreateRequest) -> PolicyRecord:
+    policy = PolicyRecord(
+        policy_id=str(uuid4()),
+        name=payload.name,
+        category=payload.category,
+        spec=payload.spec,
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+    POLICIES[policy.policy_id] = policy
+    _record_event("policy.created", f"policy {policy.name} created")
+    _create_completed_task("policy.create", policy.policy_id, f"policy {policy.name} created")
+    return policy
+
+
+@app.get("/api/v1/policies", response_model=list[PolicyRecord])
+def list_policies() -> list[PolicyRecord]:
+    return list(POLICIES.values())
+
+
+@app.post("/api/v1/policies/{policy_id}/bind-host")
+def bind_policy_to_host(policy_id: str, payload: PolicyBindingRequest, db: Session = Depends(get_db)) -> dict:
+    policy = POLICIES.get(policy_id)
+    if not policy:
+        raise HTTPException(status_code=404, detail="policy not found")
+    if not payload.host_id:
+        raise HTTPException(status_code=400, detail="host_id is required")
+
+    _get_host_or_404(db, payload.host_id)
+    bindings = HOST_POLICY_BINDINGS.setdefault(payload.host_id, [])
+    if policy_id not in bindings:
+        bindings.append(policy_id)
+    _record_event("policy.bind.host", f"policy {policy.name} bound to host {payload.host_id}")
+    return {"policy_id": policy_id, "host_id": payload.host_id, "bindings": bindings}
+
+
+@app.post("/api/v1/policies/{policy_id}/bind-project")
+def bind_policy_to_project(policy_id: str, payload: PolicyBindingRequest) -> dict:
+    policy = POLICIES.get(policy_id)
+    if not policy:
+        raise HTTPException(status_code=404, detail="policy not found")
+    if not payload.project_id:
+        raise HTTPException(status_code=400, detail="project_id is required")
+    if payload.project_id not in PROJECTS:
+        raise HTTPException(status_code=404, detail="project not found")
+
+    bindings = PROJECT_POLICY_BINDINGS.setdefault(payload.project_id, [])
+    if policy_id not in bindings:
+        bindings.append(policy_id)
+    _record_event("policy.bind.project", f"policy {policy.name} bound to project {payload.project_id}")
+    return {"policy_id": policy_id, "project_id": payload.project_id, "bindings": bindings}
+
+
+@app.get("/api/v1/policies/effective")
+def effective_policies(host_id: str | None = None, project_id: str | None = None) -> dict:
+    host_policy_ids = HOST_POLICY_BINDINGS.get(host_id or "", [])
+    project_policy_ids = PROJECT_POLICY_BINDINGS.get(project_id or "", [])
+
+    resolved_ids = list(dict.fromkeys(host_policy_ids + project_policy_ids))
+    resolved = [POLICIES[policy_id] for policy_id in resolved_ids if policy_id in POLICIES]
+    return {
+        "host_id": host_id,
+        "project_id": project_id,
+        "policies": resolved,
+    }
+
+
 @app.get("/api/v1/events", response_model=list[EventRecord])
-def list_events(limit: int = 50) -> list[EventRecord]:
+def list_events(limit: int = 50, event_type: str | None = None, since: str | None = None) -> list[EventRecord]:
     if limit <= 0:
         raise HTTPException(status_code=400, detail="limit must be > 0")
-    return EVENTS[: min(limit, 200)]
+    events = EVENTS
+    if event_type:
+        events = [event for event in events if event.type == event_type]
+    if since:
+        events = [event for event in events if event.created_at >= since]
+    return events[: min(limit, 200)]
 
 
 @app.get("/api/v1/overview")
@@ -649,6 +1027,7 @@ def overview(db: Session = Depends(get_db)) -> dict:
         },
         "events": {"total": len(EVENTS)},
         "tasks": {"total": len(TASKS)},
+        "policies": {"total": len(POLICIES)},
     }
 
 
@@ -656,6 +1035,14 @@ def overview(db: Session = Depends(get_db)) -> dict:
 def vm_console(vm_id: str, host_id: str, db: Session = Depends(get_db)) -> ConsoleTicketResponse:
     host = _get_host_or_404(db, host_id)
     ticket = str(uuid4())
+    session = {
+        "session_id": str(uuid4()),
+        "host_id": host_id,
+        "vm_id": vm_id,
+        "ticket": ticket,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    CONSOLE_SESSIONS.insert(0, session)
     _record_event("vm.console.ticket", f"console ticket requested for vm {vm_id} on host {host_id}")
     return ConsoleTicketResponse(
         host_id=host_id,
@@ -738,3 +1125,23 @@ def get_task(task_id: str) -> TaskRecord:
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
     return task
+
+
+@app.get("/{path:path}", include_in_schema=False, response_class=HTMLResponse)
+def dashboard_fallback(path: str, db: Session = Depends(get_db)) -> HTMLResponse:
+    if _is_api_or_reserved_path(path):
+        raise HTTPException(status_code=404, detail="page not found")
+    return HTMLResponse(dashboard_home(db))
+
+
+@app.exception_handler(404)
+def not_found_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    return JSONResponse(
+        status_code=404,
+        content={
+            "detail": exc.detail if isinstance(exc.detail, str) else "page not found",
+            "path": str(request.url.path),
+            "suggestions": _dashboard_route_hints(),
+            "routes_api": _with_base("/api/v1/routes"),
+        },
+    )
