@@ -37,7 +37,15 @@ The goal is to give you a clean base to build a full OpenShift-inspired operatio
 ```text
 .
 ├── agent/
-│   ├── agent.py
+│   ├── agent.py                  # compatibility entrypoint for uvicorn
+│   ├── app/
+│   │   ├── __init__.py
+│   │   ├── config.py             # environment + host configuration loading
+│   │   ├── main.py               # FastAPI app wiring + lifecycle hooks
+│   │   ├── routes.py             # API endpoints for VM/network operations
+│   │   ├── schemas.py            # pydantic request/response models
+│   │   ├── services.py           # heartbeat + dashboard sync logic
+│   │   └── state.py              # shared in-memory state container
 │   ├── Dockerfile
 │   └── requirements.txt
 ├── dashboard/
@@ -51,6 +59,15 @@ The goal is to give you a clean base to build a full OpenShift-inspired operatio
 ├── docker-compose.yml
 └── README.md
 ```
+
+## Dashboard ↔ Agent linking model
+
+- `dashboard` keeps source-of-truth host inventory in SQLite and exposes central APIs.
+- `agent` auto-registers and sends heartbeat updates to dashboard using `DASHBOARD_URL`.
+- Dashboard calls host-agent APIs (`/agent/vms`, `/agent/networks`, snapshots) using host address + port `9090`.
+- This split lets you troubleshoot either side independently:
+  - Agent-side logic and state issues: inspect `agent/app/routes.py`, `agent/app/services.py`, and `/agent/status`.
+  - Control-plane orchestration issues: inspect `dashboard/app/main.py` and `/api/v1/events`.
 
 ---
 
@@ -152,6 +169,7 @@ curl -X POST http://127.0.0.1:9090/agent/push-now
   - delete VM
   - create/list/delete host networks
   - attach network to VM
+  - create/list/delete qcow2 image records per host
 
 ### 🚧 Not implemented yet (next phases)
 - Live migration and advanced VM lifecycle policies
@@ -167,6 +185,8 @@ curl -X POST http://127.0.0.1:9090/agent/push-now
 - VM resize operation (`cpu_cores`, `memory_mb`)
 - VM migration workflow across hosts via dashboard orchestration
 - VM snapshots lifecycle (`create`, `list`, `revert`, `delete`)
+- VM clone operation
+- VM metadata operations (labels + annotations)
 - Network detach operation (`detach network from VM`)
 
 
@@ -192,6 +212,27 @@ curl -X POST http://127.0.0.1:9090/agent/push-now
 - Runbook execution API for OpenShift-like day-2 automation trigger flows
 - Task tracking APIs (`list/get`) so operation results can be queried and audited
 - Dashboard render hardening for recent events section (pre-rendered event html)
+
+
+### ✅ Added in this phase (OpenShift-style policy controls)
+- Policies API (create/list)
+- Policy binding to hosts and projects
+- Effective policy resolution endpoint for troubleshooting
+- Capabilities discovery endpoint for UI/API clients
+
+### New APIs in this phase
+- `GET /api/v1/capabilities`
+- `GET /api/v1/routes`
+- `GET /api/v1/dashboard/diagnostics`
+- `GET /api/v1/roadmap`
+- `GET /api/v1/pending-tasks`
+- `POST /api/v1/policies`
+- `GET /api/v1/policies`
+- `POST /api/v1/policies/{policy_id}/bind-host`
+- `POST /api/v1/policies/{policy_id}/bind-project`
+- `GET /api/v1/policies/effective?host_id=<host-id>&project_id=<project-id>`
+- `GET /dashboard` (dashboard alias)
+- `GET /ui` (dashboard alias)
 
 ### New APIs in this phase
 - `POST /api/v1/projects/{project_id}/members`
@@ -486,3 +527,165 @@ curl http://127.0.0.1:8000/api/v1/backbone/check
 
 If `/healthz` fails, dashboard service is not running.
 If `/healthz` works but `/` still fails, ensure requests are sent to the dashboard port (not another local service) and that reverse proxy path forwarding includes `/`.
+
+- `POST /api/v1/vms/{vm_id}/clone`
+- `POST /api/v1/vms/{vm_id}/metadata`
+
+
+## Quick non-Docker validation (avoids Docker page-not-found confusion)
+
+Start dashboard directly:
+
+```bash
+uvicorn dashboard.app.main:app --host 0.0.0.0 --port 8000
+```
+
+Then verify routes:
+
+```bash
+curl http://127.0.0.1:8000/healthz
+curl http://127.0.0.1:8000/
+curl http://127.0.0.1:8000/dashboard
+curl http://127.0.0.1:8000/ui
+curl http://127.0.0.1:8000/index.html
+curl http://127.0.0.1:8000/home
+curl http://127.0.0.1:8000/api/v1/capabilities
+curl http://127.0.0.1:8000/api/v1/routes
+curl http://127.0.0.1:8000/api/v1/dashboard/diagnostics
+```
+
+
+## Base-path mode (for reverse proxies)
+
+If your ingress/proxy serves dashboard under a prefix (for example `/kvm`), set:
+
+```bash
+export DASHBOARD_BASE_PATH=/kvm
+uvicorn dashboard.app.main:app --host 0.0.0.0 --port 8000
+```
+
+Then both UI and API can be accessed with the prefix:
+
+```bash
+curl http://127.0.0.1:8000/kvm/dashboard
+curl http://127.0.0.1:8000/kvm/api/v1/routes
+curl http://127.0.0.1:8000/kvm/api/v1/dashboard/diagnostics
+```
+
+
+## Next phase plan (explicit)
+
+### Phase 6 - Execution Backend (next)
+- Integrate libvirt-backed VM lifecycle execution in host-agent
+- Implement real host network backend operations (bridge/VLAN)
+- Build qcow2 image import pipeline with checksum verification
+
+### Phase 7 - Console + UX
+- Replace noVNC placeholder with real tokenized console proxy path
+- Add task retry and event filtering in dashboard
+- Add project-scoped health views
+
+### Phase 8 - Policy Enforcement
+- Enforce policy checks before VM/network operations
+- Add audit export and event retention controls
+- Add scheduled runbooks and reusable templates
+
+## Pending tasks (tracked in API)
+Use:
+
+```bash
+curl http://127.0.0.1:8000/api/v1/roadmap
+curl http://127.0.0.1:8000/api/v1/pending-tasks
+```
+
+## Multi-page dashboard navigation (new)
+
+The dashboard UI is now split into navigable pages similar to OpenShift console sections:
+
+- `/dashboard` - overview
+- `/vms` - VM inventory view
+- `/storage` - storage/image import jobs
+- `/console` - console session view
+- `/networks` - network inventory view
+- `/images` - image catalog view
+- `/projects` - project list view
+- `/policies` - policy list view
+- `/events` - event timeline view
+- `/tasks` - task history view
+
+Each page includes a shared left navigation and loads live data from API endpoints.
+
+## Phase 6, 7, 8 implementation foundations (new)
+
+### Phase 6 - Execution Backend foundations
+- `GET /api/v1/phase6/execution`
+- `POST /api/v1/images/import`
+- `GET /api/v1/images/import-jobs`
+
+### Phase 7 - Console + UX foundations
+- `GET /api/v1/console/sessions`
+- `POST /api/v1/tasks/{task_id}/retry`
+- Enhanced `GET /api/v1/events` filters: `event_type`, `since`
+
+### Phase 8 - Policy + audit foundations
+- Policy enforcement hook for selected mutating actions (VM provision/action, network create, image create)
+- `GET /api/v1/audit/export`
+- `GET /api/v1/events/retention`
+- `POST /api/v1/events/retention?days=<n>`
+- `GET /api/v1/runbooks/templates`
+- `POST /api/v1/runbooks/templates`
+- `GET /api/v1/runbooks/schedules`
+- `POST /api/v1/runbooks/schedules`
+
+## Refined VM/Storage/Console UX updates
+
+Latest UI update adds OpenShift-style interaction for operators:
+
+- VM page includes direct actions: **Run**, **Shutdown**, **Reboot**, **Pause**, **Resume**, and **Console**.
+- VM page supports **Create VM** and **Import VM** flows from the UI.
+- Storage page shows **storage pools** with qcow2 volumes and VM-disk associations for quick visibility.
+- Network page includes quick **Create network** action.
+- Images page includes quick **Create image** and **Import image pipeline** actions.
+
+New control-plane APIs used by this UX:
+
+- `POST /api/v1/vms/import`
+- `GET /api/v1/hosts/{host_id}/storage-pools`
+
+## Live API mode (default) - no local DB file
+
+Dashboard now runs in **live API mode by default** with in-memory inventory storage (no `kvm_dashboard.db` file persisted).
+
+- Default behavior: ephemeral in-memory SQLite (`sqlite+pysqlite:///:memory:`)
+- To enable file persistence again:
+
+```bash
+export PERSIST_LOCAL_DB=true
+# optional override:
+export DATABASE_URL=sqlite:///./kvm_dashboard.db
+```
+
+This keeps the app focused on live API fetch workflows from host agents while avoiding stale local DB artifacts in default runs.
+
+## Live inventory + VM attachments APIs
+
+To support fully live API-driven UI data (no mocked page state), the dashboard exposes:
+
+- `GET /api/v1/hosts/{host_id}/inventory-live`
+  - returns live host state, VM list, network list, image list, and VM attachment summary
+- `GET /api/v1/vms/{vm_id}/attachments?host_id=<host-id>`
+  - returns VM-level attachments: image, attached networks, snapshots, qcow2 volume metadata
+
+## noVNC live console URL integration
+
+Console ticket API now returns a live noVNC viewer URL composed from env-configurable values:
+
+- `NOVNC_BASE_URL` (default: `/console/noVNC/viewer`)
+- `NOVNC_WS_BASE` (default: `/console/noVNC/websockify`)
+
+Example:
+
+```bash
+export NOVNC_BASE_URL=https://novnc.example.com/vnc.html
+export NOVNC_WS_BASE=wss://novnc.example.com/websockify
+```
