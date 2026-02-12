@@ -3,15 +3,24 @@ import threading
 from collections.abc import Generator
 
 from sqlalchemy import create_engine
+from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import Session, sessionmaker
 
 from .models import Base
 
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./kvm_dashboard.db")
-connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+# Live-mode default: keep host inventory ephemeral in memory to avoid local DB files.
+# Set PERSIST_LOCAL_DB=true to restore sqlite file persistence.
+if os.getenv("PERSIST_LOCAL_DB", "false").strip().lower() in {"1", "true", "yes"}:
+    DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./kvm_dashboard.db")
+else:
+    DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+pysqlite:///:memory:")
 
-engine = create_engine(DATABASE_URL, connect_args=connect_args)
+connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+engine_kwargs = {"connect_args": connect_args}
+if DATABASE_URL.endswith(":memory:"):
+    engine_kwargs["poolclass"] = StaticPool
+engine = create_engine(DATABASE_URL, **engine_kwargs)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 _db_initialized = False

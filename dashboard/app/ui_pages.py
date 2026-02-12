@@ -134,9 +134,28 @@ def render_dashboard_page(
             return `<table>${{thead}}${{tbody}}</table>`;
           }}
 
-          async function pickHostId() {{
+          let selectedHostId = null;
+
+          async function getHosts() {{
             const hosts = await api('/api/v1/hosts');
-            return hosts[0]?.host_id || null;
+            return Array.isArray(hosts) ? hosts : [];
+          }}
+
+          function renderHostSelector(hosts, selectedId, selectId) {{
+            if (!hosts.length) return "<span class='muted'>No hosts registered</span>";
+            const options = hosts.map(h => `<option value='${{h.host_id}}' ${{h.host_id === selectedId ? 'selected' : ''}}>${{h.name}} (${{h.host_id}})</option>`).join('');
+            return `<label class='muted'>Host:</label><select id='${{selectId}}'>${{options}}</select>`;
+          }}
+
+          async function pickSelectedHostId() {{
+            const hosts = await getHosts();
+            if (!hosts.length) return {{ hosts, hostId: null }};
+            const saved = localStorage.getItem('kvm.selectedHostId');
+            const chosen = selectedHostId || saved;
+            const valid = hosts.some(h => h.host_id === chosen) ? chosen : hosts[0].host_id;
+            selectedHostId = valid;
+            localStorage.setItem('kvm.selectedHostId', valid);
+            return {{ hosts, hostId: valid }};
           }}
 
           function bindSearch() {{
@@ -146,6 +165,17 @@ def render_dashboard_page(
               rows.forEach((row, idx) => {{
                 row.style.display = !q || currentRows[idx]?.includes(q) ? '' : 'none';
               }});
+            }};
+          }}
+
+
+          function bindHostSelector(selectId, reloadFn) {{
+            const el = document.getElementById(selectId);
+            if (!el) return;
+            el.onchange = () => {{
+              selectedHostId = el.value;
+              localStorage.setItem('kvm.selectedHostId', selectedHostId);
+              reloadFn();
             }};
           }}
 
@@ -167,8 +197,9 @@ def render_dashboard_page(
           }}
 
           async function loadVMs() {{
-            const hostId = await pickHostId();
+            const {{ hosts, hostId }} = await pickSelectedHostId();
             actions.innerHTML = `<strong>VM operations</strong>
+              <div class='row'>${{renderHostSelector(hosts, hostId, 'vmHostSelect')}}</div>
               <div class='row'>
                 <input id='vmName' placeholder='VM name' />
                 <input id='vmCpu' type='number' value='2' min='1' style='width:80px' />
@@ -181,27 +212,33 @@ def render_dashboard_page(
                 <input id='impVmName' placeholder='Import VM name' />
                 <button class='btn' id='importVmBtn'>Import VM</button>
               </div>
-              <div class='muted'>Power controls in table: Run, Shutdown, Reboot, Pause, Resume, Console</div>`;
+              <div class='muted'>All VM state, attachments, qcow2 mapping, and snapshots are loaded from live APIs.</div>`;
             if (!hostId) {{
               content.innerHTML = "<div class='muted'>No hosts registered yet.</div>";
               return;
             }}
-            const data = await api(`/api/v1/hosts/${{hostId}}/vms`);
-            const rows = (data.vms || []).map(vm => [
-              vm.name,
-              vm.image,
-              vm.cpu_cores,
-              vm.memory_mb,
-              `<span class='pill ${{vm.power_state}}'>${{vm.power_state}}</span>`,
-              (vm.networks || []).join(', ') || '-',
-              `<button class='btn' onclick="vmPower('${{vm.vm_id}}','start','${{hostId}}')">Run</button>
-               <button class='btn warn' onclick="vmPower('${{vm.vm_id}}','stop','${{hostId}}')">Shutdown</button>
-               <button class='btn' onclick="vmPower('${{vm.vm_id}}','reboot','${{hostId}}')">Reboot</button>
-               <button class='btn warn' onclick="vmPower('${{vm.vm_id}}','pause','${{hostId}}')">Pause</button>
-               <button class='btn' onclick="vmPower('${{vm.vm_id}}','resume','${{hostId}}')">Resume</button>
-               <button class='btn' onclick="openConsole('${{vm.vm_id}}','${{hostId}}')">Console</button>`
-            ]);
-            content.innerHTML = `<strong>VM inventory</strong>${{table(['Name','Image','CPU','Memory MB','State','Networks','Actions'], rows)}}`;
+            const live = await api(`/api/v1/hosts/${{hostId}}/inventory-live`);
+            const rows = (live.vms || []).map(vm => {{
+              const att = (live.attachments || {{}})[vm.vm_id] || {{}};
+              const snaps = (att.snapshots || []).length;
+              return [
+                vm.name,
+                vm.image,
+                vm.cpu_cores,
+                vm.memory_mb,
+                `<span class='pill ${{vm.power_state}}'>${{vm.power_state}}</span>`,
+                (att.networks || vm.networks || []).join(', ') || '-',
+                `${{snaps}} snapshot(s)`,
+                `<button class='btn' onclick="vmPower('${{vm.vm_id}}','start','${{hostId}}')">Run</button>
+                 <button class='btn warn' onclick="vmPower('${{vm.vm_id}}','stop','${{hostId}}')">Shutdown</button>
+                 <button class='btn' onclick="vmPower('${{vm.vm_id}}','reboot','${{hostId}}')">Reboot</button>
+                 <button class='btn warn' onclick="vmPower('${{vm.vm_id}}','pause','${{hostId}}')">Pause</button>
+                 <button class='btn' onclick="vmPower('${{vm.vm_id}}','resume','${{hostId}}')">Resume</button>
+                 <button class='btn' onclick="openConsole('${{vm.vm_id}}','${{hostId}}')">Console</button>
+                 <button class='btn' onclick="viewAttach('${{vm.vm_id}}','${{hostId}}')">Attachments</button>`
+              ];
+            }});
+            content.innerHTML = `<strong>VM inventory (live)</strong>${{table(['Name','Image','CPU','Memory MB','State','Networks','Snapshots','Actions'], rows)}}`;
             document.getElementById('createVmBtn').onclick = async () => {{
               await api('/api/v1/vms/provision', 'POST', {{
                 host_id: hostId,
@@ -230,6 +267,7 @@ def render_dashboard_page(
               loadVMs();
             }};
             bindSearch();
+            bindHostSelector('vmHostSelect', loadVMs);
           }}
 
           window.vmPower = async (vmId, action, hostId) => {{
@@ -239,16 +277,28 @@ def render_dashboard_page(
             }} catch (e) {{ setError(e); }}
           }};
 
+          window.viewAttach = async (vmId, hostId) => {{
+            try {{
+              const details = await api(`/api/v1/vms/${{vmId}}/attachments?host_id=${{encodeURIComponent(hostId)}}`);
+              const att = details.attachments || {{}};
+              alert(`VM: ${{vmId}}
+Image: ${{att.image?.name || 'n/a'}}
+Networks: ${{(att.networks || []).map(n => n.name || n.network_id || '-').join(', ') || '-'}}
+Snapshots: ${{(att.snapshots || []).length}}
+Volumes: ${{(att.volumes || []).map(v => v.name).join(', ') || '-'}}`);
+            }} catch (e) {{ setError(e); }}
+          }};
+
           window.openConsole = async (vmId, hostId) => {{
             try {{
               const c = await api(`/api/v1/vms/${{vmId}}/console?host_id=${{encodeURIComponent(hostId)}}`);
-              window.open((base || '') + c.noVNC_url, '_blank');
+              window.open(c.noVNC_url, '_blank');
             }} catch (e) {{ setError(e); }}
           }};
 
           async function loadStorage() {{
-            const hostId = await pickHostId();
-            actions.innerHTML = `<strong>Storage actions</strong><div class='muted'>Storage pools include qcow2 images and VM disks.</div>`;
+            const {{ hosts, hostId }} = await pickSelectedHostId();
+            actions.innerHTML = `<strong>Storage actions</strong><div class='row'>${{renderHostSelector(hosts, hostId, 'storageHostSelect')}}</div><div class='muted'>Storage pools include qcow2 images and VM disks.</div>`;
             if (!hostId) {{ content.innerHTML = "<div class='muted'>No hosts registered yet.</div>"; return; }}
             const data = await api(`/api/v1/hosts/${{hostId}}/storage-pools`);
             const rows = [];
@@ -258,11 +308,12 @@ def render_dashboard_page(
             }});
             content.innerHTML = `<strong>Storage pools and volumes</strong>${{table(['Name','Type/Kind','State/Used by','Capacity GB','Allocated GB','Available GB'], rows)}}`;
             bindSearch();
+            bindHostSelector('storageHostSelect', loadStorage);
           }}
 
           async function loadNetworks() {{
-            const hostId = await pickHostId();
-            actions.innerHTML = `<strong>Network actions</strong><div class='row'><input id='netName' placeholder='network name' /><input id='netCidr' placeholder='10.10.0.0/24' /><input id='netVlan' type='number' placeholder='vlan' style='width:90px' /><button class='btn' id='createNetBtn'>Create network</button></div>`;
+            const {{ hosts, hostId }} = await pickSelectedHostId();
+            actions.innerHTML = `<strong>Network actions</strong><div class='row'>${{renderHostSelector(hosts, hostId, 'networkHostSelect')}}</div><div class='row'><input id='netName' placeholder='network name' /><input id='netCidr' placeholder='10.10.0.0/24' /><input id='netVlan' type='number' placeholder='vlan' style='width:90px' /><button class='btn' id='createNetBtn'>Create network</button></div>`;
             if (!hostId) {{ content.innerHTML = "<div class='muted'>No hosts registered yet.</div>"; return; }}
             const data = await api(`/api/v1/hosts/${{hostId}}/networks`);
             const rows = (data.networks || []).map(n => [n.name, n.cidr, n.vlan_id ?? '-', (n.attached_vm_ids || []).join(', ') || '-']);
@@ -272,11 +323,12 @@ def render_dashboard_page(
               loadNetworks();
             }};
             bindSearch();
+            bindHostSelector('networkHostSelect', loadNetworks);
           }}
 
           async function loadImages() {{
-            const hostId = await pickHostId();
-            actions.innerHTML = `<strong>Image actions</strong><div class='row'><input id='imgName' placeholder='image name' /><input id='imgSrc' placeholder='https://.../image.qcow2' style='min-width:280px'/><button class='btn' id='createImgBtn'>Create image</button><button class='btn' id='importImgBtn'>Import image pipeline</button></div>`;
+            const {{ hosts, hostId }} = await pickSelectedHostId();
+            actions.innerHTML = `<strong>Image actions</strong><div class='row'>${{renderHostSelector(hosts, hostId, 'imageHostSelect')}}</div><div class='row'><input id='imgName' placeholder='image name' /><input id='imgSrc' placeholder='https://.../image.qcow2' style='min-width:280px'/><button class='btn' id='createImgBtn'>Create image</button><button class='btn' id='importImgBtn'>Import image pipeline</button></div>`;
             if (!hostId) {{ content.innerHTML = "<div class='muted'>No hosts registered yet.</div>"; return; }}
             const data = await api(`/api/v1/hosts/${{hostId}}/images`);
             const rows = (data.images || []).map(i => [i.name, i.status, i.source_url, i.created_at]);
@@ -290,11 +342,12 @@ def render_dashboard_page(
               loadImages();
             }};
             bindSearch();
+            bindHostSelector('imageHostSelect', loadImages);
           }}
 
           async function loadConsole() {{
-            const hostId = await pickHostId();
-            actions.innerHTML = `<strong>Console options</strong><div class='muted'>Use the VMs page “Console” action or request here manually.</div><div class='row'><input id='conVm' placeholder='vm id'/><button class='btn' id='conBtn'>Create console ticket</button></div>`;
+            const {{ hosts, hostId }} = await pickSelectedHostId();
+            actions.innerHTML = `<strong>Console options</strong><div class='row'>${{renderHostSelector(hosts, hostId, 'consoleHostSelect')}}</div><div class='muted'>Use the VMs page “Console” action or request here manually.</div><div class='row'><input id='conVm' placeholder='vm id'/><button class='btn' id='conBtn'>Create console ticket</button></div>`;
             const sess = await api('/api/v1/console/sessions');
             const rows = (sess.items || []).map(s => [s.session_id, s.host_id, s.vm_id, s.created_at]);
             content.innerHTML = `<strong>Console sessions</strong>${{table(['Session','Host','VM','Created'], rows)}}`;
@@ -302,9 +355,10 @@ def render_dashboard_page(
               if (!hostId) return;
               const vmId = document.getElementById('conVm').value;
               const t = await api(`/api/v1/vms/${{vmId}}/console?host_id=${{encodeURIComponent(hostId)}}`);
-              window.open((base || '') + t.noVNC_url, '_blank');
+              window.open(t.noVNC_url, '_blank');
             }};
             bindSearch();
+            bindHostSelector('consoleHostSelect', loadConsole);
           }}
 
           async function loadEvents() {{

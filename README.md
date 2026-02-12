@@ -651,3 +651,41 @@ New control-plane APIs used by this UX:
 
 - `POST /api/v1/vms/import`
 - `GET /api/v1/hosts/{host_id}/storage-pools`
+
+## Live API mode (default) - no local DB file
+
+Dashboard now runs in **live API mode by default** with in-memory inventory storage (no `kvm_dashboard.db` file persisted).
+
+- Default behavior: ephemeral in-memory SQLite (`sqlite+pysqlite:///:memory:`)
+- To enable file persistence again:
+
+```bash
+export PERSIST_LOCAL_DB=true
+# optional override:
+export DATABASE_URL=sqlite:///./kvm_dashboard.db
+```
+
+This keeps the app focused on live API fetch workflows from host agents while avoiding stale local DB artifacts in default runs.
+
+## Live inventory + VM attachments APIs
+
+To support fully live API-driven UI data (no mocked page state), the dashboard exposes:
+
+- `GET /api/v1/hosts/{host_id}/inventory-live`
+  - returns live host state, VM list, network list, image list, and VM attachment summary
+- `GET /api/v1/vms/{vm_id}/attachments?host_id=<host-id>`
+  - returns VM-level attachments: image, attached networks, snapshots, qcow2 volume metadata
+
+## noVNC live console URL integration
+
+Console ticket API now returns a live noVNC viewer URL composed from env-configurable values:
+
+- `NOVNC_BASE_URL` (default: `/console/noVNC/viewer`)
+- `NOVNC_WS_BASE` (default: `/console/noVNC/websockify`)
+
+Example:
+
+```bash
+export NOVNC_BASE_URL=https://novnc.example.com/vnc.html
+export NOVNC_WS_BASE=wss://novnc.example.com/websockify
+```

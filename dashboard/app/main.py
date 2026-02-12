@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 import os
 from typing import Any
 from uuid import uuid4
+from urllib.parse import urlencode
 
 import requests
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
@@ -48,6 +49,8 @@ app = FastAPI(title="KVM Dashboard API", version="0.7.1")
 
 AGENT_PORT = 9090
 AGENT_TIMEOUT_S = 10
+NOVNC_BASE_URL = os.getenv("NOVNC_BASE_URL", "/console/noVNC/viewer")
+NOVNC_WS_BASE = os.getenv("NOVNC_WS_BASE", "/console/noVNC/websockify")
 BASE_PATH = os.getenv("DASHBOARD_BASE_PATH", "").strip()
 if BASE_PATH and not BASE_PATH.startswith("/"):
     BASE_PATH = f"/{BASE_PATH}"
@@ -235,6 +238,22 @@ def _agent_base_url(host: Host) -> str:
     return f"http://{host.address}:{AGENT_PORT}"
 
 
+def _fetch_agent_json(method: str, url: str, *, json_payload: dict | None = None) -> Any:
+    try:
+        if method == "GET":
+            response = requests.get(url, timeout=AGENT_TIMEOUT_S)
+        elif method == "POST":
+            response = requests.post(url, json=json_payload, timeout=AGENT_TIMEOUT_S)
+        elif method == "DELETE":
+            response = requests.delete(url, timeout=AGENT_TIMEOUT_S)
+        else:
+            raise ValueError(f"unsupported method: {method}")
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"agent request failed: {exc}") from exc
+
+
 def _get_host_or_404(db: Session, host_id: str) -> Host:
     host = db.query(Host).filter(Host.host_id == host_id).first()
     if not host:
@@ -409,6 +428,74 @@ def list_host_vms(host_id: str, db: Session = Depends(get_db)) -> dict:
         raise HTTPException(status_code=502, detail=f"agent request failed: {exc}") from exc
 
     return {"host_id": host_id, "vms": response.json()}
+
+
+@app.get("/api/v1/hosts/{host_id}/inventory-live")
+def host_inventory_live(host_id: str, db: Session = Depends(get_db)) -> dict:
+    host = _get_host_or_404(db, host_id)
+    vms = _fetch_agent_json("GET", f"{_agent_base_url(host)}/agent/vms")
+    networks = _fetch_agent_json("GET", f"{_agent_base_url(host)}/agent/networks")
+    images = _fetch_agent_json("GET", f"{_agent_base_url(host)}/agent/images")
+
+    vm_snapshots: dict[str, Any] = {}
+    for vm in vms:
+        vm_id = vm.get("vm_id")
+        if not vm_id:
+            continue
+        vm_snapshots[vm_id] = _fetch_agent_json("GET", f"{_agent_base_url(host)}/agent/vms/{vm_id}/snapshots")
+
+    attachments = {
+        vm.get("vm_id"): {
+            "networks": vm.get("networks", []),
+            "image": vm.get("image"),
+            "snapshots": vm_snapshots.get(vm.get("vm_id"), []),
+        }
+        for vm in vms
+        if vm.get("vm_id")
+    }
+
+    return {
+        "host_id": host_id,
+        "state": {
+            "vm_count": len(vms),
+            "network_count": len(networks),
+            "image_count": len(images),
+            "snapshot_count": sum(len(items) for items in vm_snapshots.values()),
+        },
+        "vms": vms,
+        "networks": networks,
+        "images": images,
+        "attachments": attachments,
+    }
+
+
+@app.get("/api/v1/vms/{vm_id}/attachments")
+def vm_attachments(vm_id: str, host_id: str, db: Session = Depends(get_db)) -> dict:
+    host = _get_host_or_404(db, host_id)
+    vms = _fetch_agent_json("GET", f"{_agent_base_url(host)}/agent/vms")
+    vm = next((item for item in vms if item.get("vm_id") == vm_id), None)
+    if not vm:
+        raise HTTPException(status_code=404, detail="vm not found")
+
+    snapshots = _fetch_agent_json("GET", f"{_agent_base_url(host)}/agent/vms/{vm_id}/snapshots")
+    networks = _fetch_agent_json("GET", f"{_agent_base_url(host)}/agent/networks")
+    images = _fetch_agent_json("GET", f"{_agent_base_url(host)}/agent/images")
+
+    attached_networks = [net for net in networks if vm_id in net.get("attached_vm_ids", []) or net.get("name") in vm.get("networks", [])]
+    image_record = next((img for img in images if img.get("name") in {vm.get("image"), f"{vm.get('image', '')}.qcow2"}), None)
+
+    volume_name = f"{vm.get('name', 'vm')}-{vm_id[:8]}.qcow2"
+    return {
+        "host_id": host_id,
+        "vm_id": vm_id,
+        "power_state": vm.get("power_state"),
+        "attachments": {
+            "image": image_record,
+            "networks": attached_networks,
+            "snapshots": snapshots,
+            "volumes": [{"name": volume_name, "format": "qcow2", "size_gb": 20}],
+        },
+    }
 
 
 @app.post("/api/v1/vms/{vm_id}/action")
@@ -1098,11 +1185,23 @@ def overview(db: Session = Depends(get_db)) -> dict:
 def vm_console(vm_id: str, host_id: str, db: Session = Depends(get_db)) -> ConsoleTicketResponse:
     host = _get_host_or_404(db, host_id)
     ticket = str(uuid4())
+    ws_url = f"{NOVNC_WS_BASE}?{urlencode({'host_id': host_id, 'vm_id': vm_id, 'ticket': ticket})}"
+    viewer_query = urlencode({
+        "host_id": host_id,
+        "vm_id": vm_id,
+        "ticket": ticket,
+        "path": ws_url,
+        "autoconnect": 1,
+        "resize": "remote",
+    })
+    novnc_url = f"{NOVNC_BASE_URL}?{viewer_query}"
+
     session = {
         "session_id": str(uuid4()),
         "host_id": host_id,
         "vm_id": vm_id,
         "ticket": ticket,
+        "novnc_url": novnc_url,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     CONSOLE_SESSIONS.insert(0, session)
@@ -1111,24 +1210,22 @@ def vm_console(vm_id: str, host_id: str, db: Session = Depends(get_db)) -> Conso
         host_id=host_id,
         vm_id=vm_id,
         ticket=ticket,
-        noVNC_url=f"/console/noVNC?host_id={host_id}&vm_id={vm_id}&ticket={ticket}",
+        noVNC_url=novnc_url,
     )
 
 
 @app.get("/console/noVNC", response_class=HTMLResponse)
-def novnc_console_placeholder(host_id: str, vm_id: str, ticket: str) -> str:
+def novnc_console_redirect(host_id: str, vm_id: str, ticket: str) -> str:
+    ws_url = f"{NOVNC_WS_BASE}?{urlencode({'host_id': host_id, 'vm_id': vm_id, 'ticket': ticket})}"
+    target = f"{NOVNC_BASE_URL}?{urlencode({'host_id': host_id, 'vm_id': vm_id, 'ticket': ticket, 'path': ws_url, 'autoconnect': 1, 'resize': 'remote'})}"
     return f"""
     <!doctype html>
     <html>
       <head><meta charset='utf-8'/><title>noVNC Console</title></head>
       <body style='background:#0b1020;color:#e6ecff;font-family:Arial;padding:20px'>
-        <h2>Console placeholder</h2>
-        <p>This screen reserves the noVNC integration path for VM console sessions.</p>
-        <ul>
-          <li>Host: {host_id}</li>
-          <li>VM: {vm_id}</li>
-          <li>Ticket: {ticket}</li>
-        </ul>
+        <h2>Opening noVNC console...</h2>
+        <p>If redirection does not start automatically, use <a style='color:#71a7ff' href='{target}'>this noVNC link</a>.</p>
+        <script>window.location.replace({target!r});</script>
       </body>
     </html>
     """
