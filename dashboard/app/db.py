@@ -3,24 +3,22 @@ import threading
 from collections.abc import Generator
 
 from sqlalchemy import create_engine
-from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import Session, sessionmaker
 
 from .models import Base
 
 
-# Live-mode default: keep host inventory ephemeral in memory to avoid local DB files.
-# Set PERSIST_LOCAL_DB=true to restore sqlite file persistence.
-if os.getenv("PERSIST_LOCAL_DB", "false").strip().lower() in {"1", "true", "yes"}:
-    DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./kvm_dashboard.db")
-else:
-    DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+pysqlite:///:memory:")
+DEFAULT_POSTGRES_URL = "postgresql+psycopg://kvm:kvm@postgres:5432/kvm_dashboard"
+DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_POSTGRES_URL)
 
-connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-engine_kwargs = {"connect_args": connect_args}
-if DATABASE_URL.endswith(":memory:"):
-    engine_kwargs["poolclass"] = StaticPool
-engine = create_engine(DATABASE_URL, **engine_kwargs)
+if not DATABASE_URL.startswith("postgresql"):
+    raise RuntimeError("DATABASE_URL must be a PostgreSQL URL (postgresql+psycopg://...) for this build")
+
+try:
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+except ModuleNotFoundError as exc:
+    raise RuntimeError("PostgreSQL driver missing. Install dashboard dependencies (psycopg[binary]).") from exc
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 _db_initialized = False
@@ -46,4 +44,3 @@ def get_db() -> Generator[Session, None, None]:
         yield db
     finally:
         db.close()
-

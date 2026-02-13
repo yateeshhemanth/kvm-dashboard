@@ -43,6 +43,8 @@ from .schemas import (
     RunbookExecuteRequest,
     TaskRecord,
 )
+from .schemas_day2 import VMOperationTaskRequest, VMRecoveryISOReleaseRequest, VMRecoveryISORequest
+from .day2_services import SUPPORTED_VM_TASK_TYPES, normalize_task_type
 from .ui_pages import render_dashboard_page
 
 app = FastAPI(title="KVM Dashboard API", version="0.7.1")
@@ -632,6 +634,43 @@ def set_vm_metadata(vm_id: str, payload: VMMetadataRequest, db: Session = Depend
     _record_event("vm.metadata", f"vm {vm_id} metadata updated on host {payload.host_id}")
     return {"host_id": payload.host_id, "vm": response.json()}
 
+
+
+
+@app.post("/api/v1/vms/{vm_id}/recovery/attach-iso")
+def attach_recovery_iso(vm_id: str, payload: VMRecoveryISORequest, db: Session = Depends(get_db)) -> dict:
+    host = _get_host_or_404(db, payload.host_id)
+    url = f"{_agent_base_url(host)}/agent/vms/{vm_id}/metadata"
+    metadata_payload = {
+        "labels": {"recovery_mode": "enabled"},
+        "annotations": {
+            "recovery.iso": payload.iso_path,
+            "recovery.boot_once": str(payload.boot_once).lower(),
+            "recovery.attached_at": datetime.now(timezone.utc).isoformat(),
+        },
+    }
+    vm = _fetch_agent_json("POST", url, json_payload=metadata_payload)
+    _record_event("vm.recovery.iso.attach", f"recovery ISO attached for vm {vm_id} on host {payload.host_id}")
+    _create_completed_task("vm.recovery.iso.attach", vm_id, f"iso={payload.iso_path}")
+    return {"host_id": payload.host_id, "vm_id": vm_id, "status": "attached", "vm": vm}
+
+
+@app.post("/api/v1/vms/{vm_id}/recovery/detach-iso")
+def detach_recovery_iso(vm_id: str, payload: VMRecoveryISOReleaseRequest, db: Session = Depends(get_db)) -> dict:
+    host = _get_host_or_404(db, payload.host_id)
+    url = f"{_agent_base_url(host)}/agent/vms/{vm_id}/metadata"
+    metadata_payload = {
+        "labels": {"recovery_mode": "disabled"},
+        "annotations": {
+            "recovery.iso": "",
+            "recovery.boot_once": "false",
+            "recovery.detached_at": datetime.now(timezone.utc).isoformat(),
+        },
+    }
+    vm = _fetch_agent_json("POST", url, json_payload=metadata_payload)
+    _record_event("vm.recovery.iso.detach", f"recovery ISO detached for vm {vm_id} on host {payload.host_id}")
+    _create_completed_task("vm.recovery.iso.detach", vm_id, "recovery iso detached")
+    return {"host_id": payload.host_id, "vm_id": vm_id, "status": "detached", "vm": vm}
 
 @app.post("/api/v1/vms/{vm_id}/migrate")
 def migrate_vm(vm_id: str, payload: VMMigrateRequest, db: Session = Depends(get_db)) -> dict:
@@ -1270,6 +1309,19 @@ def execute_runbook(runbook_name: str, payload: RunbookExecuteRequest) -> TaskRe
     _record_event("runbook.executed", f"runbook {runbook_name} executed for {target}")
     return task
 
+
+
+
+@app.post("/api/v1/tasks/vm-operations", response_model=TaskRecord)
+def create_vm_operation_task(payload: VMOperationTaskRequest) -> TaskRecord:
+    task_type = normalize_task_type(payload.task_type)
+    if task_type not in SUPPORTED_VM_TASK_TYPES:
+        raise HTTPException(status_code=400, detail=f"unsupported task_type '{payload.task_type}'")
+    target = payload.vm_id or payload.host_id or "cluster"
+    detail = f"vm_id={payload.vm_id or '-'}, host_id={payload.host_id or '-'}"
+    task = _create_completed_task(task_type, target, detail)
+    _record_event("task.vm_operation.created", f"{task_type} requested for {target}")
+    return task
 
 @app.get("/api/v1/tasks", response_model=list[TaskRecord])
 def list_tasks(limit: int = 50) -> list[TaskRecord]:
