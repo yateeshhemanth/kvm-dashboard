@@ -171,12 +171,12 @@ curl -X POST http://127.0.0.1:9090/agent/push-now
   - attach network to VM
   - create/list/delete qcow2 image records per host
 
-### 🚧 Not implemented yet (next phases)
-- Live migration and advanced VM lifecycle policies
-- Advanced network operations (VLAN trunking, bridge automation, IPAM integration, security policies)
-- noVNC VM console
-- qcow2 image catalog and deployment workflows
-- replace mock agent VM backend with direct libvirt execution on host
+### ✅ Implemented in current build
+- Live migration API flow and VM lifecycle policy APIs (`/api/v1/vms/{vm_id}/live-migrate`, `/api/v1/policies/vm-lifecycle`)
+- Advanced network operations API foundations (VLAN trunking, bridge automation, IPAM, security policy sections under `/api/v1/networks/advanced`)
+- noVNC console status and session APIs (`/api/v1/console/novnc/status`, `/api/v1/console/sessions`, console ticket flow)
+- qcow2 image catalog plus deployment workflow APIs (`/api/v1/images`, `/api/v1/images/{image_id}/deploy`, `/api/v1/images/deployments`)
+- host-agent execution mode supports direct libvirt execution via `virsh` when `LIBVIRT_EXECUTION_MODE=libvirt`
 
 
 

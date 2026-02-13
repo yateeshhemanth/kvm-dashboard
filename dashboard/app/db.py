@@ -10,8 +10,9 @@ from .models import Base
 
 DEFAULT_POSTGRES_URL = "postgresql+psycopg://kvm:kvm@postgres:5432/kvm_dashboard"
 DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_POSTGRES_URL)
+ALLOW_SQLITE_FOR_TESTS = os.getenv("ALLOW_SQLITE_FOR_TESTS", "false").strip().lower() in {"1", "true", "yes"}
 
-if not DATABASE_URL.startswith("postgresql"):
+if not DATABASE_URL.startswith("postgresql") and not (ALLOW_SQLITE_FOR_TESTS and DATABASE_URL.startswith("sqlite")):
     raise RuntimeError("DATABASE_URL must be a PostgreSQL URL (postgresql+psycopg://...) for this build")
 
 try:

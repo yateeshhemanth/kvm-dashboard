@@ -24,18 +24,3 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-
-  host-agent:
-    build: ./agent
-    container_name: kvm-host-agent
-    ports:
-      - "9090:9090"
-    environment:
-      DASHBOARD_URL: http://dashboard:8000
-      HOST_ID: kvm-host-01
-      HOST_NAME: kvm-host-01
-      HOST_ADDRESS: 192.168.1.101
-      LIBVIRT_URI: qemu+ssh://root@10.110.17.153/system
-      HEARTBEAT_INTERVAL: 15
-    depends_on:
-      - dashboard

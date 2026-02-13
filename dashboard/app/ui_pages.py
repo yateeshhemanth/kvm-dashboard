@@ -191,13 +191,15 @@ def render_dashboard_page(
           async function loadOverview() {{
             actions.innerHTML = `<strong>Quick links</strong><div class='row'><a class='btn' href='${{base||''}}/vms'>Go to VMs</a><a class='btn' href='${{base||''}}/storage'>Go to Storage</a><a class='btn' href='${{base||''}}/networks'>Go to Networks</a><a class='btn' href='${{base||''}}/console'>Go to Console</a></div>`;
             const ov = await api('/api/v1/overview');
+            const live = await api('/api/v1/live/status');
             const rows = [
               ['Hosts total', ov.hosts.total, 'Ready', ov.hosts.ready],
               ['CPU cores', ov.hosts.total_cpu_cores, 'Memory MB', ov.hosts.total_memory_mb],
               ['Projects', ov.projects.total, 'Policies', ov.policies.total],
               ['Events', ov.events.total, 'Tasks', ov.tasks.total],
             ];
-            content.innerHTML = `<strong>Cluster summary</strong>${{table(['Metric','Value','Metric','Value'], rows)}}`;
+            const hostRows = (live.items || []).map(h => [h.host_id, h.status, h.agent_reachable ? 'reachable' : 'down', h.execution, h.libvirt_uri]);
+            content.innerHTML = `<strong>Cluster summary</strong>${{table(['Metric','Value','Metric','Value'], rows)}}<div style='margin-top:10px'><strong>Live host API status</strong>${{table(['Host','Status','Libvirt Reachability','Execution','Libvirt URI'], hostRows)}}</div>`;
             bindSearch();
           }}
 
@@ -445,13 +447,24 @@ Recovery ISO: ${{vm.annotations?.['recovery.iso'] || 'not attached'}}`);
 
           async function loadNetworks() {{
             const {{ hosts, hostId }} = await pickSelectedHostId();
-            actions.innerHTML = `<strong>Network actions</strong><div class='row'>${{renderHostSelector(hosts, hostId, 'networkHostSelect')}}</div><div class='row'><input id='netName' placeholder='network name' /><input id='netCidr' placeholder='10.10.0.0/24' /><input id='netVlan' type='number' placeholder='vlan' style='width:90px' /><button class='btn' id='createNetBtn'>Create network</button></div>`;
+            actions.innerHTML = `<strong>Network actions</strong><div class='row'>${{renderHostSelector(hosts, hostId, 'networkHostSelect')}}</div><div class='row'><input id='netName' placeholder='network name' /><input id='netCidr' placeholder='10.10.0.0/24' /><input id='netVlan' type='number' placeholder='vlan' style='width:90px' /><button class='btn' id='createNetBtn'>Create network</button></div><div class='row'><select id='advSection'><option value='vlan_trunks'>VLAN trunking</option><option value='bridge_automation'>Bridge automation</option><option value='ipam'>IPAM</option><option value='security_policies'>Security policy</option></select><input id='advName' placeholder='name/description' /><button class='btn' id='addAdvNetBtn'>Add advanced policy</button></div>`;
             if (!hostId) {{ content.innerHTML = "<div class='muted'>No hosts registered yet.</div>"; return; }}
             const data = await api(`/api/v1/hosts/${{hostId}}/networks`);
+            const adv = await api('/api/v1/networks/advanced');
             const rows = (data.networks || []).map(n => [n.name, n.cidr, n.vlan_id ?? '-', (n.attached_vm_ids || []).join(', ') || '-']);
-            content.innerHTML = `<strong>Virtual networks</strong>${{table(['Name','CIDR','VLAN','Attached VMs'], rows)}}`;
+            (adv.vlan_trunks || []).forEach(item => rows.push([`ADV::${{item.name || item.id}}`, 'trunk', item.id, '-']));
+            (adv.bridge_automation || []).forEach(item => rows.push([`ADV::${{item.name || item.id}}`, 'bridge', item.id, '-']));
+            (adv.ipam || []).forEach(item => rows.push([`ADV::${{item.name || item.id}}`, 'ipam', item.id, '-']));
+            (adv.security_policies || []).forEach(item => rows.push([`ADV::${{item.name || item.id}}`, 'security', item.id, '-']));
+            content.innerHTML = `<strong>Virtual and advanced networks</strong>${{table(['Name','CIDR/Type','VLAN/ID','Attached VMs'], rows)}}`;
             document.getElementById('createNetBtn').onclick = async () => {{
               await api('/api/v1/networks', 'POST', {{ host_id: hostId, name: document.getElementById('netName').value, cidr: document.getElementById('netCidr').value, vlan_id: Number(document.getElementById('netVlan').value) || null }});
+              loadNetworks();
+            }};
+            document.getElementById('addAdvNetBtn').onclick = async () => {{
+              const section = document.getElementById('advSection').value;
+              const name = document.getElementById('advName').value;
+              await api(`/api/v1/networks/advanced/${{section}}`, 'POST', {{ name }});
               loadNetworks();
             }};
             bindSearch();
@@ -460,17 +473,23 @@ Recovery ISO: ${{vm.annotations?.['recovery.iso'] || 'not attached'}}`);
 
           async function loadImages() {{
             const {{ hosts, hostId }} = await pickSelectedHostId();
-            actions.innerHTML = `<strong>Image actions</strong><div class='row'>${{renderHostSelector(hosts, hostId, 'imageHostSelect')}}</div><div class='row'><input id='imgName' placeholder='image name' /><input id='imgSrc' placeholder='https://.../image.qcow2' style='min-width:280px'/><button class='btn' id='createImgBtn'>Create image</button><button class='btn' id='importImgBtn'>Import image pipeline</button></div>`;
+            actions.innerHTML = `<strong>Image actions</strong><div class='row'>${{renderHostSelector(hosts, hostId, 'imageHostSelect')}}</div><div class='row'><input id='imgName' placeholder='image name' /><input id='imgSrc' placeholder='https://.../image.qcow2' style='min-width:280px'/><button class='btn' id='createImgBtn'>Create image</button><button class='btn' id='importImgBtn'>Import image pipeline</button></div><div class='row'><input id='depImgId' placeholder='image id' /><input id='depVmName' placeholder='target vm name' /><button class='btn' id='deployImgBtn'>Deploy image</button></div>`;
             if (!hostId) {{ content.innerHTML = "<div class='muted'>No hosts registered yet.</div>"; return; }}
             const data = await api(`/api/v1/hosts/${{hostId}}/images`);
-            const rows = (data.images || []).map(i => [i.name, i.status, i.source_url, i.created_at]);
-            content.innerHTML = `<strong>qcow2 image catalog</strong>${{table(['Name','Status','Source','Created at'], rows)}}`;
+            const deployments = await api('/api/v1/images/deployments');
+            const rows = (data.images || []).map(i => [i.image_id || '-', i.name, i.status, i.source_url, i.created_at]);
+            (deployments.items || []).forEach(d => rows.push([d.image_id, `DEPLOY::${{d.vm_name}}`, d.status, d.host_id, d.created_at]));
+            content.innerHTML = `<strong>qcow2 image catalog + deployments</strong>${{table(['Image ID','Name','Status','Source/Host','Created at'], rows)}}`;
             document.getElementById('createImgBtn').onclick = async () => {{
               await api('/api/v1/images', 'POST', {{ host_id: hostId, name: document.getElementById('imgName').value, source_url: document.getElementById('imgSrc').value }});
               loadImages();
             }};
             document.getElementById('importImgBtn').onclick = async () => {{
               await api('/api/v1/images/import', 'POST', {{ host_id: hostId, name: document.getElementById('imgName').value, source_url: document.getElementById('imgSrc').value }});
+              loadImages();
+            }};
+            document.getElementById('deployImgBtn').onclick = async () => {{
+              await api(`/api/v1/images/${{document.getElementById('depImgId').value}}/deploy?host_id=${{encodeURIComponent(hostId)}}&vm_name=${{encodeURIComponent(document.getElementById('depVmName').value)}}`, 'POST');
               loadImages();
             }};
             bindSearch();
@@ -481,8 +500,10 @@ Recovery ISO: ${{vm.annotations?.['recovery.iso'] || 'not attached'}}`);
             const {{ hosts, hostId }} = await pickSelectedHostId();
             actions.innerHTML = `<strong>Console options</strong><div class='row'>${{renderHostSelector(hosts, hostId, 'consoleHostSelect')}}</div><div class='muted'>Use the VMs page “Console” action or request here manually.</div><div class='row'><input id='conVm' placeholder='vm id'/><button class='btn' id='conBtn'>Create console ticket</button></div>`;
             const sess = await api('/api/v1/console/sessions');
+            const novnc = await api('/api/v1/console/novnc/status');
             const rows = (sess.items || []).map(s => [s.session_id, s.host_id, s.vm_id, s.created_at]);
-            content.innerHTML = `<strong>Console sessions</strong>${{table(['Session','Host','VM','Created'], rows)}}`;
+            rows.unshift(['noVNC base', '-', novnc.novnc_base_url, `ws:${{novnc.novnc_ws_base}}`]);
+            content.innerHTML = `<strong>Console sessions + noVNC status</strong>${{table(['Session','Host','VM','Created/Path'], rows)}}`;
             document.getElementById('conBtn').onclick = async () => {{
               if (!hostId) return;
               const vmId = document.getElementById('conVm').value;
@@ -545,6 +566,21 @@ Recovery ISO: ${{vm.annotations?.['recovery.iso'] || 'not attached'}}`);
             loadTasks();
           }};
 
+
+          async function loadPolicies() {{
+            actions.innerHTML = `<strong>Policy operations</strong><div class='row'><input id='polName' placeholder='policy name'/><input id='polActions' placeholder='deny actions comma-separated'/><button class='btn' id='savePolBtn'>Save VM lifecycle policy</button></div>`;
+            const data = await api('/api/v1/policies/vm-lifecycle');
+            const rows = (data.items || []).map(p => [p.name, JSON.stringify(p.spec || {{}}), p.updated_at]);
+            content.innerHTML = `<strong>VM lifecycle policies</strong>${{table(['Name','Spec','Updated'], rows)}}`;
+            document.getElementById('savePolBtn').onclick = async () => {{
+              const name = document.getElementById('polName').value || 'default';
+              const deny = document.getElementById('polActions').value;
+              await api('/api/v1/policies/vm-lifecycle', 'POST', {{ name, spec: {{ deny_actions: deny }} }});
+              loadPolicies();
+            }};
+            bindSearch();
+          }}
+
           async function loadSimple(path, title, cols, mapper) {{
             actions.innerHTML = `<strong>${{title}}</strong>`;
             const data = await api(path);
@@ -563,7 +599,7 @@ Recovery ISO: ${{vm.annotations?.['recovery.iso'] || 'not attached'}}`);
             events: loadEvents,
             tasks: loadTasks,
             projects: () => loadSimple('/api/v1/projects', 'Projects', ['Project','Description','CPU quota','Memory quota','VM limit'], d => d.map(p => [p.name,p.description,p.cpu_cores_quota,p.memory_mb_quota,p.vm_limit])),
-            policies: () => loadSimple('/api/v1/policies', 'Policies', ['Name','Category','Created'], d => d.map(p => [p.name,p.category,p.created_at])),
+            policies: loadPolicies,
           }};
 
           let refreshTimer = null;
