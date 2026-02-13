@@ -24,10 +24,15 @@ from .schemas import (
 )
 from .services import push_to_dashboard
 from .state import AgentState
+from .libvirt_executor import VirshLibvirtExecutor
 
 
 def create_router(config: AgentConfig, state: AgentState) -> APIRouter:
     router = APIRouter()
+    libvirt = VirshLibvirtExecutor(config.libvirt_uri)
+
+    def using_libvirt() -> bool:
+        return config.execution_mode == "libvirt"
 
     @router.get("/healthz")
     def healthz() -> dict[str, str]:
@@ -48,6 +53,8 @@ def create_router(config: AgentConfig, state: AgentState) -> APIRouter:
                 "interval_seconds": config.interval_seconds,
                 "vm_count": len(state.vms),
                 "network_count": len(state.networks),
+                "execution_mode": config.execution_mode,
+                "libvirt_uri": config.libvirt_uri,
             }
 
     @router.post("/agent/push-now")
@@ -65,6 +72,11 @@ def create_router(config: AgentConfig, state: AgentState) -> APIRouter:
 
     @router.get("/agent/vms", response_model=list[VMRecord])
     def list_vms() -> list[VMRecord]:
+        if using_libvirt():
+            try:
+                return libvirt.list_vms()
+            except RuntimeError as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
         with state.lock:
             return list(state.vms.values())
 
@@ -145,6 +157,15 @@ def create_router(config: AgentConfig, state: AgentState) -> APIRouter:
 
     @router.post("/agent/vms/{vm_id}/action", response_model=VMRecord)
     def vm_action(vm_id: str, payload: VMActionRequest) -> VMRecord:
+        if using_libvirt():
+            try:
+                libvirt.vm_action(vm_id, payload.action)
+                for vm in libvirt.list_vms():
+                    if vm.vm_id == vm_id:
+                        return vm
+                raise HTTPException(status_code=404, detail="vm not found")
+            except RuntimeError as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
         with state.lock:
             vm = state.vms.get(vm_id)
             if not vm:
@@ -166,6 +187,15 @@ def create_router(config: AgentConfig, state: AgentState) -> APIRouter:
 
     @router.post("/agent/vms/{vm_id}/resize", response_model=VMRecord)
     def resize_vm(vm_id: str, payload: VMResizeRequest) -> VMRecord:
+        if using_libvirt():
+            try:
+                libvirt.resize_vm(vm_id, payload.cpu_cores, payload.memory_mb)
+                for vm in libvirt.list_vms():
+                    if vm.vm_id == vm_id:
+                        return vm
+                raise HTTPException(status_code=404, detail="vm not found")
+            except RuntimeError as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
         with state.lock:
             vm = state.vms.get(vm_id)
             if not vm:
@@ -177,6 +207,12 @@ def create_router(config: AgentConfig, state: AgentState) -> APIRouter:
 
     @router.delete("/agent/vms/{vm_id}")
     def delete_vm(vm_id: str) -> dict[str, str]:
+        if using_libvirt():
+            try:
+                libvirt.delete_vm(vm_id)
+                return {"status": "deleted", "vm_id": vm_id, "executor": "libvirt"}
+            except RuntimeError as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
         with state.lock:
             vm = state.vms.get(vm_id)
             if not vm:
@@ -188,6 +224,11 @@ def create_router(config: AgentConfig, state: AgentState) -> APIRouter:
 
     @router.post("/agent/vms/{vm_id}/snapshots", response_model=SnapshotRecord)
     def create_snapshot(vm_id: str, payload: SnapshotCreateRequest) -> SnapshotRecord:
+        if using_libvirt():
+            try:
+                return libvirt.create_snapshot(vm_id, payload.name)
+            except RuntimeError as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
         with state.lock:
             vm = state.vms.get(vm_id)
             if not vm:
@@ -208,6 +249,11 @@ def create_router(config: AgentConfig, state: AgentState) -> APIRouter:
 
     @router.get("/agent/vms/{vm_id}/snapshots", response_model=list[SnapshotRecord])
     def list_snapshots(vm_id: str) -> list[SnapshotRecord]:
+        if using_libvirt():
+            try:
+                return libvirt.list_snapshots(vm_id)
+            except RuntimeError as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
         with state.lock:
             if vm_id not in state.vms:
                 raise HTTPException(status_code=404, detail="vm not found")
@@ -215,6 +261,15 @@ def create_router(config: AgentConfig, state: AgentState) -> APIRouter:
 
     @router.post("/agent/vms/{vm_id}/snapshots/{snapshot_id}/revert", response_model=VMRecord)
     def revert_snapshot(vm_id: str, snapshot_id: str) -> VMRecord:
+        if using_libvirt():
+            try:
+                libvirt.revert_snapshot(vm_id, snapshot_id)
+                for vm in libvirt.list_vms():
+                    if vm.vm_id == vm_id:
+                        return vm
+                raise HTTPException(status_code=404, detail="vm not found")
+            except RuntimeError as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
         with state.lock:
             vm = state.vms.get(vm_id)
             if not vm:
@@ -232,6 +287,12 @@ def create_router(config: AgentConfig, state: AgentState) -> APIRouter:
 
     @router.delete("/agent/vms/{vm_id}/snapshots/{snapshot_id}")
     def delete_snapshot(vm_id: str, snapshot_id: str) -> dict[str, str]:
+        if using_libvirt():
+            try:
+                libvirt.delete_snapshot(vm_id, snapshot_id)
+                return {"status": "deleted", "snapshot_id": snapshot_id, "vm_id": vm_id, "executor": "libvirt"}
+            except RuntimeError as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
         with state.lock:
             if vm_id not in state.vms:
                 raise HTTPException(status_code=404, detail="vm not found")

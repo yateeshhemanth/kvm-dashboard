@@ -171,12 +171,12 @@ curl -X POST http://127.0.0.1:9090/agent/push-now
   - attach network to VM
   - create/list/delete qcow2 image records per host
 
-### 🚧 Not implemented yet (next phases)
-- Live migration and advanced VM lifecycle policies
-- Advanced network operations (VLAN trunking, bridge automation, IPAM integration, security policies)
-- noVNC VM console
-- qcow2 image catalog and deployment workflows
-- replace mock agent VM backend with direct libvirt execution on host
+### ✅ Implemented in current build
+- Live migration API flow and VM lifecycle policy APIs (`/api/v1/vms/{vm_id}/live-migrate`, `/api/v1/policies/vm-lifecycle`)
+- Advanced network operations API foundations (VLAN trunking, bridge automation, IPAM, security policy sections under `/api/v1/networks/advanced`)
+- noVNC console status and session APIs (`/api/v1/console/novnc/status`, `/api/v1/console/sessions`, console ticket flow)
+- qcow2 image catalog plus deployment workflow APIs (`/api/v1/images`, `/api/v1/images/{image_id}/deploy`, `/api/v1/images/deployments`)
+- host-agent execution mode supports direct libvirt execution via `virsh` when `LIBVIRT_EXECUTION_MODE=libvirt`
 
 
 
@@ -268,7 +268,7 @@ Example payload:
   "address": "192.168.1.101",
   "cpu_cores": 16,
   "memory_mb": 65536,
-  "libvirt_uri": "qemu:///system"
+  "libvirt_uri": "qemu+ssh://root@10.110.17.153/system"
 }
 ```
 
@@ -416,7 +416,7 @@ export DASHBOARD_URL=http://<dashboard-server-ip>:8000
 export HOST_ID=$(hostname)
 export HOST_NAME=$(hostname)
 export HOST_ADDRESS=<host-mgmt-ip>
-export LIBVIRT_URI=qemu:///system
+export LIBVIRT_URI=qemu+ssh://root@10.110.17.153/system
 export HEARTBEAT_INTERVAL=15
 uvicorn agent:app --host 0.0.0.0 --port 9090
 ```
@@ -439,7 +439,7 @@ Environment="DASHBOARD_URL=http://<dashboard-server-ip>:8000"
 Environment="HOST_ID=%H"
 Environment="HOST_NAME=%H"
 Environment="HOST_ADDRESS=<host-mgmt-ip>"
-Environment="LIBVIRT_URI=qemu:///system"
+Environment="LIBVIRT_URI=qemu+ssh://root@10.110.17.153/system"
 Environment="HEARTBEAT_INTERVAL=15"
 ExecStart=/opt/kvm-agent/.venv/bin/uvicorn agent:app --host 0.0.0.0 --port 9090
 Restart=always
@@ -454,7 +454,7 @@ WantedBy=multi-user.target
 ## Next build steps (to reach your full vision)
 
 ### Phase 1 (immediately next)
-- Add PostgreSQL for persistence
+- Harden PostgreSQL HA/backup strategy
 - Add auth (OIDC + RBAC)
 - Add host tags and project mapping
 
@@ -625,6 +625,9 @@ Each page includes a shared left navigation and loads live data from API endpoin
 ### Phase 7 - Console + UX foundations
 - `GET /api/v1/console/sessions`
 - `POST /api/v1/tasks/{task_id}/retry`
+- `POST /api/v1/tasks/vm-operations` (day-2 VM operations queue)
+- `POST /api/v1/vms/{vm_id}/recovery/attach-iso`
+- `POST /api/v1/vms/{vm_id}/recovery/detach-iso`
 - Enhanced `GET /api/v1/events` filters: `event_type`, `since`
 
 ### Phase 8 - Policy + audit foundations
@@ -642,6 +645,8 @@ Each page includes a shared left navigation and loads live data from API endpoin
 Latest UI update adds OpenShift-style interaction for operators:
 
 - VM page includes direct actions: **Run**, **Shutdown**, **Reboot**, **Pause**, **Resume**, and **Console**.
+- VM page includes day-2 actions: **resize CPU/memory**, **clone**, **migrate**, **snapshot create/revert/delete**, **network attach/detach**, **delete**, and **recovery ISO attach/detach** for failure workflows.
+- Overview/operations pages auto-refresh every 10 seconds for real-time values fetch from API endpoints.
 - VM page supports **Create VM** and **Import VM** flows from the UI.
 - Storage page shows **storage pools** with qcow2 volumes and VM-disk associations for quick visibility.
 - Network page includes quick **Create network** action.
@@ -652,20 +657,12 @@ New control-plane APIs used by this UX:
 - `POST /api/v1/vms/import`
 - `GET /api/v1/hosts/{host_id}/storage-pools`
 
-## Live API mode (default) - no local DB file
+## Database mode (default PostgreSQL)
 
-Dashboard now runs in **live API mode by default** with in-memory inventory storage (no `kvm_dashboard.db` file persisted).
+Dashboard now runs with **PostgreSQL by default**.
 
-- Default behavior: ephemeral in-memory SQLite (`sqlite+pysqlite:///:memory:`)
-- To enable file persistence again:
-
-```bash
-export PERSIST_LOCAL_DB=true
-# optional override:
-export DATABASE_URL=sqlite:///./kvm_dashboard.db
-```
-
-This keeps the app focused on live API fetch workflows from host agents while avoiding stale local DB artifacts in default runs.
+- Default behavior: `postgresql+psycopg://kvm:kvm@postgres:5432/kvm_dashboard`
+- This build supports PostgreSQL only (no SQLite fallback).
 
 ## Live inventory + VM attachments APIs
 
@@ -689,3 +686,17 @@ Example:
 export NOVNC_BASE_URL=https://novnc.example.com/vnc.html
 export NOVNC_WS_BASE=wss://novnc.example.com/websockify
 ```
+
+
+## Libvirt query cache (PostgreSQL-backed)
+
+To reduce repeated `virsh` process spawning and PID pressure on hosts/containers, dashboard now caches per-host VM/network/image/storage snapshots in PostgreSQL table `host_libvirt_cache`.
+
+- Cache TTL env: `LIBVIRT_CACHE_TTL_S` (default: `15`)
+- Endpoints support `?refresh=true` to force recrawl from libvirt.
+
+This improves UI responsiveness while keeping operations functional (power, resize, snapshots, console ticket, etc.).
+
+
+### Direct architecture
+Dashboard (10.110.17.160) connects directly to registered hosts using each host `libvirt_uri` such as `qemu+ssh://root@10.110.17.153/system`. No host-agent process is required on `.153` for core operations. Multiple hosts are supported by adding multiple host records.
