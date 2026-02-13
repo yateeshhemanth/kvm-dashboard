@@ -6,7 +6,6 @@ from typing import Any
 from uuid import uuid4
 from urllib.parse import urlencode
 
-import requests
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from sqlalchemy import text
@@ -53,8 +52,6 @@ from .libvirt_remote import LibvirtRemote, LibvirtRemoteError
 
 app = FastAPI(title="KVM Dashboard API", version="0.7.1")
 
-AGENT_PORT = 9090
-AGENT_TIMEOUT_S = 10
 LIBVIRT_CACHE_TTL_S = int(os.getenv("LIBVIRT_CACHE_TTL_S", "15"))
 NOVNC_BASE_URL = os.getenv("NOVNC_BASE_URL", "/console/noVNC/viewer")
 NOVNC_WS_BASE = os.getenv("NOVNC_WS_BASE", "/console/noVNC/websockify")
@@ -206,6 +203,17 @@ def _enforce_policies(action: str, host_id: str | None = None, project_id: str |
         if action in blocked:
             raise HTTPException(status_code=403, detail=f"policy {policy.name} blocks action '{action}'")
 
+
+
+def _actor_role(request: Request) -> str:
+    return request.headers.get("x-role", "admin").strip().lower() or "admin"
+
+
+def _require_roles(request: Request, allowed: set[str]) -> str:
+    role = _actor_role(request)
+    if role not in allowed:
+        raise HTTPException(status_code=403, detail=f"rbac denied for role={role}; allowed={sorted(allowed)}")
+    return role
 def _project_quota_summary() -> tuple[int, int, int]:
     total_cpu = sum(project.cpu_cores_quota for project in PROJECTS.values())
     total_memory = sum(project.memory_mb_quota for project in PROJECTS.values())
@@ -245,26 +253,6 @@ def _apply_host_action(host: Host, action: HostAction) -> None:
         host.status = "disabled"
 
 
-def _agent_base_url(host: Host) -> str:
-    return f"http://{host.address}:{AGENT_PORT}"
-
-
-def _fetch_agent_json(method: str, url: str, *, json_payload: dict | None = None) -> Any:
-    try:
-        if method == "GET":
-            response = requests.get(url, timeout=AGENT_TIMEOUT_S)
-        elif method == "POST":
-            response = requests.post(url, json=json_payload, timeout=AGENT_TIMEOUT_S)
-        elif method == "DELETE":
-            response = requests.delete(url, timeout=AGENT_TIMEOUT_S)
-        else:
-            raise ValueError(f"unsupported method: {method}")
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"agent request failed: {exc}") from exc
-
-
 
 
 def _libvirt_or_502(host: Host) -> LibvirtRemote:
@@ -292,9 +280,13 @@ def _ensure_libvirt_cache_table(db: Session) -> None:
             networks_json TEXT NOT NULL,
             images_json TEXT NOT NULL,
             pools_json TEXT NOT NULL,
-            updated_at DOUBLE PRECISION NOT NULL
+            updated_at DOUBLE PRECISION NOT NULL,
+            last_error TEXT,
+            last_success_at DOUBLE PRECISION
         )
     """))
+    db.execute(text("ALTER TABLE host_libvirt_cache ADD COLUMN IF NOT EXISTS last_error TEXT"))
+    db.execute(text("ALTER TABLE host_libvirt_cache ADD COLUMN IF NOT EXISTS last_success_at DOUBLE PRECISION"))
     db.commit()
 
 
@@ -307,14 +299,16 @@ def _refresh_host_cache(db: Session, host: Host) -> dict[str, Any]:
     _ensure_libvirt_cache_table(db)
     db.execute(
         text("""
-            INSERT INTO host_libvirt_cache(host_id, vms_json, networks_json, images_json, pools_json, updated_at)
-            VALUES (:host_id, :vms_json, :networks_json, :images_json, :pools_json, :updated_at)
+            INSERT INTO host_libvirt_cache(host_id, vms_json, networks_json, images_json, pools_json, updated_at, last_error, last_success_at)
+            VALUES (:host_id, :vms_json, :networks_json, :images_json, :pools_json, :updated_at, NULL, :updated_at)
             ON CONFLICT(host_id) DO UPDATE SET
               vms_json=excluded.vms_json,
               networks_json=excluded.networks_json,
               images_json=excluded.images_json,
               pools_json=excluded.pools_json,
-              updated_at=excluded.updated_at
+              updated_at=excluded.updated_at,
+              last_error=NULL,
+              last_success_at=excluded.updated_at
         """),
         {
             "host_id": host.host_id,
@@ -331,21 +325,43 @@ def _refresh_host_cache(db: Session, host: Host) -> dict[str, Any]:
 
 def _host_cached_state(db: Session, host: Host, *, force_refresh: bool = False) -> dict[str, Any]:
     _ensure_libvirt_cache_table(db)
-    if not force_refresh:
-        row = db.execute(
-            text("SELECT vms_json, networks_json, images_json, pools_json, updated_at FROM host_libvirt_cache WHERE host_id=:host_id"),
-            {"host_id": host.host_id},
-        ).first()
-        if row and (time.time() - float(row.updated_at) <= LIBVIRT_CACHE_TTL_S):
+    row = db.execute(
+        text("SELECT vms_json, networks_json, images_json, pools_json, updated_at, last_error, last_success_at FROM host_libvirt_cache WHERE host_id=:host_id"),
+        {"host_id": host.host_id},
+    ).first()
+
+    if not force_refresh and row and (time.time() - float(row.updated_at) <= LIBVIRT_CACHE_TTL_S):
+        return {
+            "vms": json.loads(row.vms_json),
+            "networks": json.loads(row.networks_json),
+            "images": json.loads(row.images_json),
+            "pools": json.loads(row.pools_json),
+            "updated_at": float(row.updated_at),
+            "last_error": row.last_error,
+            "last_success_at": float(row.last_success_at) if row.last_success_at else None,
+            "cache": "hit",
+        }
+
+    try:
+        return _refresh_host_cache(db, host)
+    except HTTPException as exc:
+        if row:
+            db.execute(
+                text("UPDATE host_libvirt_cache SET last_error=:last_error WHERE host_id=:host_id"),
+                {"host_id": host.host_id, "last_error": str(exc.detail)},
+            )
+            db.commit()
             return {
                 "vms": json.loads(row.vms_json),
                 "networks": json.loads(row.networks_json),
                 "images": json.loads(row.images_json),
                 "pools": json.loads(row.pools_json),
                 "updated_at": float(row.updated_at),
-                "cache": "hit",
+                "last_error": str(exc.detail),
+                "last_success_at": float(row.last_success_at) if row.last_success_at else None,
+                "cache": "stale",
             }
-    return _refresh_host_cache(db, host)
+        raise
 
 def _get_host_or_404(db: Session, host_id: str) -> Host:
     host = db.query(Host).filter(Host.host_id == host_id).first()
@@ -362,14 +378,7 @@ def _render_ui_page(page: str, db: Session) -> str:
         "projects": len(PROJECTS),
         "policies": len(POLICIES),
     }
-    diagnostics = [
-        ("Base Path", BASE_PATH or "/"),
-        ("Execution Backend", "Phase 6 foundation enabled"),
-        ("Console UX", "Phase 7 foundation enabled"),
-        ("Policy + Audit", "Phase 8 foundation enabled"),
-        ("Pending Tasks", str(len(PENDING_TASKS))),
-    ]
-    return render_dashboard_page(page, base_path=BASE_PATH, stats=stats, diagnostics=diagnostics)
+    return render_dashboard_page(page, base_path=BASE_PATH, stats=stats)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -495,7 +504,7 @@ def import_vm(payload: VMImportRequest, db: Session = Depends(get_db)) -> dict:
 def list_host_vms(host_id: str, refresh: bool = False, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, host_id)
     state = _host_cached_state(db, host, force_refresh=refresh)
-    return {"host_id": host_id, "vms": state["vms"], "cache": state["cache"], "cached_at": state["updated_at"]}
+    return {"host_id": host_id, "vms": state["vms"], "cache": state["cache"], "cached_at": state["updated_at"], "last_error": state.get("last_error"), "last_success_at": state.get("last_success_at")}
 
 
 @app.get("/api/v1/hosts/{host_id}/inventory-live")
@@ -565,28 +574,22 @@ def delete_vm(vm_id: str, host_id: str, db: Session = Depends(get_db)) -> dict:
 
 
 @app.post("/api/v1/networks")
-def create_network(payload: NetworkCreateRequest, db: Session = Depends(get_db)) -> dict:
+def create_network(payload: NetworkCreateRequest, request: Request, db: Session = Depends(get_db)) -> dict:
+    _require_roles(request, {"admin", "operator"})
     _enforce_policies("network.create", host_id=payload.host_id)
     host = _get_host_or_404(db, payload.host_id)
-    url = f"{_agent_base_url(host)}/agent/networks"
-    try:
-        response = requests.post(
-            url,
-            json={"name": payload.name, "cidr": payload.cidr, "vlan_id": payload.vlan_id},
-            timeout=AGENT_TIMEOUT_S,
-        )
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"agent request failed: {exc}") from exc
-
-    return {"host_id": payload.host_id, "network": response.json()}
+    network = _libvirt_call(host, "create_network", payload.name, payload.cidr, payload.vlan_id)
+    _refresh_host_cache(db, host)
+    _record_event("network.create", f"network {payload.name} created on host {payload.host_id}")
+    _create_completed_task("network.create", payload.name, f"cidr={payload.cidr},vlan={payload.vlan_id}")
+    return {"host_id": payload.host_id, "network": network}
 
 
 @app.get("/api/v1/hosts/{host_id}/networks")
 def list_host_networks(host_id: str, refresh: bool = False, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, host_id)
     state = _host_cached_state(db, host, force_refresh=refresh)
-    return {"host_id": host_id, "networks": state["networks"], "cache": state["cache"], "cached_at": state["updated_at"]}
+    return {"host_id": host_id, "networks": state["networks"], "cache": state["cache"], "cached_at": state["updated_at"], "last_error": state.get("last_error"), "last_success_at": state.get("last_success_at")}
 
 
 @app.post("/api/v1/networks/{network_id}/attach")
@@ -597,8 +600,11 @@ def attach_network(network_id: str, payload: NetworkAttachRequest, db: Session =
 
 
 @app.delete("/api/v1/networks/{network_id}")
-def delete_network(network_id: str, host_id: str, db: Session = Depends(get_db)) -> dict:
-    _get_host_or_404(db, host_id)
+def delete_network(network_id: str, host_id: str, request: Request, db: Session = Depends(get_db)) -> dict:
+    _require_roles(request, {"admin", "operator"})
+    host = _get_host_or_404(db, host_id)
+    _libvirt_call(host, "delete_network", network_id)
+    _refresh_host_cache(db, host)
     _record_event("network.delete", f"network {network_id} deleted on {host_id}")
     return {"host_id": host_id, "result": {"status": "deleted", "network_id": network_id}}
 
@@ -736,47 +742,36 @@ def api_backbone_check(db: Session = Depends(get_db)) -> dict:
 def list_host_images(host_id: str, refresh: bool = False, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, host_id)
     state = _host_cached_state(db, host, force_refresh=refresh)
-    return {"host_id": host_id, "images": state["images"], "cache": state["cache"], "cached_at": state["updated_at"]}
+    return {"host_id": host_id, "images": state["images"], "cache": state["cache"], "cached_at": state["updated_at"], "last_error": state.get("last_error"), "last_success_at": state.get("last_success_at")}
 
 
 @app.get("/api/v1/hosts/{host_id}/storage-pools")
 def list_storage_pools(host_id: str, refresh: bool = False, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, host_id)
     state = _host_cached_state(db, host, force_refresh=refresh)
-    return {"host_id": host_id, "storage_pools": state["pools"], "cache": state["cache"], "cached_at": state["updated_at"]}
+    return {"host_id": host_id, "storage_pools": state["pools"], "cache": state["cache"], "cached_at": state["updated_at"], "last_error": state.get("last_error"), "last_success_at": state.get("last_success_at")}
 
 
 @app.post("/api/v1/images")
-def create_image(payload: ImageCreateRequest, db: Session = Depends(get_db)) -> dict:
+def create_image(payload: ImageCreateRequest, request: Request, db: Session = Depends(get_db)) -> dict:
+    _require_roles(request, {"admin", "operator"})
     _enforce_policies("image.create", host_id=payload.host_id)
     host = _get_host_or_404(db, payload.host_id)
-    url = f"{_agent_base_url(host)}/agent/images"
-    try:
-        response = requests.post(
-            url,
-            json={"name": payload.name, "source_url": payload.source_url},
-            timeout=AGENT_TIMEOUT_S,
-        )
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"agent request failed: {exc}") from exc
-
+    image = _libvirt_call(host, "create_image", payload.name, payload.source_url or "default", 20)
+    _refresh_host_cache(db, host)
     _record_event("image.created", f"image {payload.name} created on host {payload.host_id}")
-    return {"host_id": payload.host_id, "image": response.json()}
+    _create_completed_task("image.create", payload.name, f"pool={payload.source_url or 'default'}")
+    return {"host_id": payload.host_id, "image": image}
 
 
 @app.delete("/api/v1/images/{image_id}")
-def delete_image(image_id: str, host_id: str, db: Session = Depends(get_db)) -> dict:
+def delete_image(image_id: str, host_id: str, request: Request, db: Session = Depends(get_db)) -> dict:
+    _require_roles(request, {"admin", "operator"})
     host = _get_host_or_404(db, host_id)
-    url = f"{_agent_base_url(host)}/agent/images/{image_id}"
-    try:
-        response = requests.delete(url, timeout=AGENT_TIMEOUT_S)
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"agent request failed: {exc}") from exc
-
+    result = _libvirt_call(host, "delete_image", image_id)
+    _refresh_host_cache(db, host)
     _record_event("image.deleted", f"image {image_id} deleted from host {host_id}")
-    return {"host_id": host_id, "result": response.json()}
+    return {"host_id": host_id, "result": result}
 
 
 @app.post("/api/v1/projects", response_model=ProjectRecord)
@@ -976,6 +971,18 @@ def list_routes() -> dict:
     return {"count": len(routes), "routes": routes, "dashboard_hints": _dashboard_route_hints(), "base_path": BASE_PATH or "/"}
 
 
+@app.get("/api/v1/rbac/roles")
+def rbac_roles() -> dict:
+    return {
+        "roles": {
+            "admin": ["*"] ,
+            "operator": ["vm.*", "network.*", "image.*", "console.*", "task.retry"],
+            "viewer": ["read.*"],
+        },
+        "header": "x-role",
+    }
+
+
 @app.get("/api/v1/capabilities")
 def capabilities() -> dict:
     return {
@@ -995,6 +1002,9 @@ def capabilities() -> dict:
             "vm_create_libvirt_live": True,
             "vm_attachments_libvirt_live": True,
             "console_libvirt_display_discovery": True,
+            "network_crud_libvirt_live": True,
+            "image_crud_libvirt_live": True,
+            "rbac_header_enforcement": True,
             "phase7_timeline_and_retry": True,
             "phase8_policy_enforcement_foundation": True,
         },
@@ -1355,12 +1365,26 @@ def dashboard_fallback(path: str, db: Session = Depends(get_db)) -> HTMLResponse
 
 
 @app.exception_handler(404)
-def not_found_handler(request: Request, exc: HTTPException) -> JSONResponse:
+def not_found_handler(request: Request, exc: HTTPException):
+    path = str(request.url.path)
+    accept = request.headers.get("accept", "")
+    if "text/html" in accept and not _is_api_or_reserved_path(path):
+        db_gen = get_db()
+        try:
+            db = next(db_gen)
+            return HTMLResponse(_render_ui_page("dashboard", db), status_code=200)
+        except Exception:
+            pass
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
     return JSONResponse(
         status_code=404,
         content={
             "detail": exc.detail if isinstance(exc.detail, str) else "page not found",
-            "path": str(request.url.path),
+            "path": path,
             "suggestions": _dashboard_route_hints(),
             "routes_api": _with_base("/api/v1/routes"),
         },

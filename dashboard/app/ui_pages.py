@@ -32,7 +32,6 @@ def render_dashboard_page(
     *,
     base_path: str,
     stats: dict[str, Any],
-    diagnostics: list[tuple[str, str]],
 ) -> str:
     page_key = page if page in PAGE_CONFIG else "dashboard"
     config = PAGE_CONFIG[page_key]
@@ -45,7 +44,6 @@ def render_dashboard_page(
         )
         nav_html += f"<div class='nav-group'><div class='nav-title'>{group}</div>{links}</div>"
 
-    diagnostics_html = "".join(f"<li><strong>{label}:</strong> {value}</li>" for label, value in diagnostics)
 
     return f"""
     <!doctype html>
@@ -109,7 +107,6 @@ def render_dashboard_page(
             </div>
             <div class='card' id='actions'></div>
             <div class='card' style='margin-top:12px' id='content'></div>
-            <div class='card' style='margin-top:12px'><strong>Platform Status</strong><ul>{diagnostics_html}</ul></div>
             </div>
           </main>
         </div>

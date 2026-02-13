@@ -184,6 +184,47 @@ class LibvirtRemote:
                     images.append({"image_id": f"{pool['name']}::{vol['name']}", "name": vol["name"], "source_url": pool["name"], "status": "available", "created_at": datetime.now(timezone.utc).isoformat()})
         return images
 
+
+    def create_network(self, name: str, cidr: str, vlan_id: int | None = None) -> dict[str, Any]:
+        ip_part, prefix = cidr.split("/")
+        octets = ip_part.split(".")
+        if len(octets) != 4:
+            raise LibvirtRemoteError("invalid CIDR")
+        gateway = f"{octets[0]}.{octets[1]}.{octets[2]}.1"
+        network_xml = f"""
+<network>
+  <name>{name}</name>
+  <forward mode='nat'/>
+  <bridge name='virbr-{name[:8]}' stp='on' delay='0'/>
+  <ip address='{gateway}' prefix='{prefix}'/>
+</network>
+""".strip()
+        with tempfile.NamedTemporaryFile("w", suffix=".xml", delete=True) as tmp:
+            tmp.write(network_xml)
+            tmp.flush()
+            self._run(["net-define", tmp.name])
+        self._run(["net-autostart", name])
+        self._run(["net-start", name])
+        return {"network_id": name, "name": name, "cidr": cidr, "vlan_id": vlan_id, "attached_vm_ids": []}
+
+    def delete_network(self, network_id: str) -> None:
+        try:
+            self._run(["net-destroy", network_id])
+        except LibvirtRemoteError:
+            pass
+        self._run(["net-undefine", network_id])
+
+    def create_image(self, name: str, pool: str = "default", size_gb: int = 20) -> dict[str, Any]:
+        self._run(["vol-create-as", pool, name, f"{size_gb}G", "--format", "qcow2"])
+        return {"image_id": f"{pool}::{name}", "name": name, "source_url": pool, "status": "available", "created_at": datetime.now(timezone.utc).isoformat()}
+
+    def delete_image(self, image_id: str) -> dict[str, Any]:
+        pool, _, volume = image_id.partition("::")
+        if not pool or not volume:
+            raise LibvirtRemoteError("image_id must be '<pool>::<volume>'")
+        self._run(["vol-delete", volume, "--pool", pool])
+        return {"status": "deleted", "image_id": image_id}
+
     def migrate(self, vm_id: str, target_uri: str, live: bool = True) -> None:
         args = ["migrate"]
         if live:
