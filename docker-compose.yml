@@ -1,25 +1,26 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: kvm-dashboard-postgres
+    environment:
+      POSTGRES_DB: kvm_dashboard
+      POSTGRES_USER: kvm
+      POSTGRES_PASSWORD: kvm
+    volumes:
+      - ./postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kvm -d kvm_dashboard"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   dashboard:
     build: ./dashboard
     container_name: kvm-dashboard-api
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: sqlite:////data/kvm_dashboard.db
-    volumes:
-      - ./dashboard-data:/data
-
-  host-agent:
-    build: ./agent
-    container_name: kvm-host-agent
-    ports:
-      - "9090:9090"
-    environment:
-      DASHBOARD_URL: http://dashboard:8000
-      HOST_ID: kvm-host-01
-      HOST_NAME: kvm-host-01
-      HOST_ADDRESS: 192.168.1.101
-      LIBVIRT_URI: qemu:///system
-      HEARTBEAT_INTERVAL: 15
+      DATABASE_URL: postgresql+psycopg://kvm:kvm@postgres:5432/kvm_dashboard
     depends_on:
-      - dashboard
+      postgres:
+        condition: service_healthy

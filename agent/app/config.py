@@ -11,6 +11,7 @@ class AgentConfig:
     host_address: str
     libvirt_uri: str
     interval_seconds: int = 15
+    execution_mode: str = "mock"
 
 
 def load_config() -> AgentConfig:
@@ -21,6 +22,7 @@ def load_config() -> AgentConfig:
         host_id=os.getenv("HOST_ID", host_name),
         host_name=os.getenv("HOST_NAME", host_name),
         host_address=os.getenv("HOST_ADDRESS", host_address),
-        libvirt_uri=os.getenv("LIBVIRT_URI", "qemu:///system"),
+        libvirt_uri=os.getenv("LIBVIRT_URI", "qemu+ssh://root@10.110.17.153/system"),
         interval_seconds=int(os.getenv("HEARTBEAT_INTERVAL", "15")),
+        execution_mode=os.getenv("LIBVIRT_EXECUTION_MODE", "mock").strip().lower(),
     )

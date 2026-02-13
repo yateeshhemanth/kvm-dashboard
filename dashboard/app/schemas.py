@@ -10,7 +10,7 @@ class HostRegisterRequest(BaseModel):
     address: str
     cpu_cores: int = 0
     memory_mb: int = 0
-    libvirt_uri: str = "qemu:///system"
+    libvirt_uri: str = "qemu+ssh://root@10.110.17.153/system"
 
 
 class HeartbeatRequest(BaseModel):
