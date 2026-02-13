@@ -475,8 +475,11 @@ def list_hosts(db: Session = Depends(get_db)) -> list[Host]:
 def provision_vm(payload: VMProvisionRequest, db: Session = Depends(get_db)) -> dict:
     _enforce_policies("vm.provision", host_id=payload.host_id)
     host = _get_host_or_404(db, payload.host_id)
-    _create_completed_task("vm.provision", payload.name, f"requested cpu={payload.cpu_cores},mem={payload.memory_mb},image={payload.image}")
-    return {"host_id": payload.host_id, "vm": {"vm_id": payload.name, "name": payload.name, "cpu_cores": payload.cpu_cores, "memory_mb": payload.memory_mb, "image": payload.image, "power_state": "stopped"}, "status": "queued"}
+    vm = _libvirt_call(host, "create_vm", payload.name, payload.cpu_cores, payload.memory_mb, payload.image, payload.network)
+    _refresh_host_cache(db, host)
+    _record_event("vm.provision", f"vm {payload.name} created on host {payload.host_id}")
+    _create_completed_task("vm.provision", payload.name, f"created cpu={payload.cpu_cores},mem={payload.memory_mb},image={payload.image},network={payload.network}")
+    return {"host_id": payload.host_id, "vm": vm, "status": "created"}
 
 
 @app.post("/api/v1/vms/import")
@@ -512,16 +515,16 @@ def host_inventory_live(host_id: str, refresh: bool = False, db: Session = Depen
 @app.get("/api/v1/vms/{vm_id}/attachments")
 def vm_attachments(vm_id: str, host_id: str, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, host_id)
-    vms = _fetch_agent_json("GET", f"{_agent_base_url(host)}/agent/vms")
-    vm = next((item for item in vms if item.get("vm_id") == vm_id), None)
+    state = _host_cached_state(db, host)
+    vm = next((item for item in state["vms"] if item.get("vm_id") == vm_id), None)
     if not vm:
         raise HTTPException(status_code=404, detail="vm not found")
 
-    snapshots = _fetch_agent_json("GET", f"{_agent_base_url(host)}/agent/vms/{vm_id}/snapshots")
-    networks = _fetch_agent_json("GET", f"{_agent_base_url(host)}/agent/networks")
-    images = _fetch_agent_json("GET", f"{_agent_base_url(host)}/agent/images")
+    snapshots = _libvirt_call(host, "snapshot_list", vm_id)
+    networks = state["networks"]
+    images = state["images"]
 
-    attached_networks = [net for net in networks if vm_id in net.get("attached_vm_ids", []) or net.get("name") in vm.get("networks", [])]
+    attached_networks = [net for net in networks if net.get("name") in vm.get("networks", [])]
     image_record = next((img for img in images if img.get("name") in {vm.get("image"), f"{vm.get('image', '')}.qcow2"}), None)
 
     override = VM_METADATA_OVERRIDES.get(host_id, {}).get(vm_id, {"labels": {}, "annotations": {}})
@@ -977,7 +980,7 @@ def list_routes() -> dict:
 def capabilities() -> dict:
     return {
         "platform": "kvm-dashboard",
-        "mode": "openshift-inspired",
+        "mode": "libvirt-live-proxmox-style",
         "features": {
             "host_lifecycle": True,
             "vm_lifecycle": True,
@@ -986,9 +989,12 @@ def capabilities() -> dict:
             "projects_quotas": True,
             "runbooks_tasks_events": True,
             "policies": True,
-            "console_ticket_placeholder": True,
+            "console_ticket_placeholder": False,
             "multi_page_dashboard": True,
             "phase6_execution_backend_foundation": True,
+            "vm_create_libvirt_live": True,
+            "vm_attachments_libvirt_live": True,
+            "console_libvirt_display_discovery": True,
             "phase7_timeline_and_retry": True,
             "phase8_policy_enforcement_foundation": True,
         },
@@ -1107,6 +1113,12 @@ def overview(db: Session = Depends(get_db)) -> dict:
 @app.get("/api/v1/vms/{vm_id}/console", response_model=ConsoleTicketResponse)
 def vm_console(vm_id: str, host_id: str, db: Session = Depends(get_db)) -> ConsoleTicketResponse:
     host = _get_host_or_404(db, host_id)
+    state = _host_cached_state(db, host)
+    vm = next((item for item in state["vms"] if item.get("vm_id") == vm_id), None)
+    if not vm:
+        raise HTTPException(status_code=404, detail="vm not found")
+
+    console = _libvirt_call(host, "console_info", vm_id)
     ticket = str(uuid4())
     ws_url = f"{NOVNC_WS_BASE}?{urlencode({'host_id': host_id, 'vm_id': vm_id, 'ticket': ticket})}"
     viewer_query = urlencode({
@@ -1125,6 +1137,8 @@ def vm_console(vm_id: str, host_id: str, db: Session = Depends(get_db)) -> Conso
         "vm_id": vm_id,
         "ticket": ticket,
         "novnc_url": novnc_url,
+        "display_uri": console.get("display_uri"),
+        "vnc_port": str(console.get("vnc_port") or ""),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     CONSOLE_SESSIONS.insert(0, session)

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import re
 import subprocess
+import tempfile
 from datetime import datetime, timezone
 from typing import Any
+from uuid import uuid4
 
 
 class LibvirtRemoteError(RuntimeError):
@@ -68,6 +70,65 @@ class LibvirtRemote:
             "resume": ["resume", vm_id],
         }
         self._run(mapping[action])
+
+    def create_vm(self, name: str, cpu_cores: int, memory_mb: int, image: str, network: str = "default") -> dict[str, Any]:
+        domain_xml = f"""
+<domain type='kvm'>
+  <name>{name}</name>
+  <uuid>{uuid4()}</uuid>
+  <memory unit='MiB'>{memory_mb}</memory>
+  <currentMemory unit='MiB'>{memory_mb}</currentMemory>
+  <vcpu>{cpu_cores}</vcpu>
+  <os>
+    <type arch='x86_64' machine='pc'>hvm</type>
+    <boot dev='hd'/>
+    <boot dev='network'/>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+  </features>
+  <clock offset='utc'/>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    <interface type='network'>
+      <source network='{network}'/>
+      <model type='virtio'/>
+    </interface>
+    <graphics type='vnc' autoport='yes' listen='0.0.0.0'/>
+    <console type='pty'/>
+    <serial type='pty'/>
+    <video>
+      <model type='vga' vram='16384' heads='1'/>
+    </video>
+  </devices>
+</domain>
+""".strip()
+
+        with tempfile.NamedTemporaryFile("w", suffix=".xml", delete=True) as tmp:
+            tmp.write(domain_xml)
+            tmp.flush()
+            self._run(["define", tmp.name])
+
+        return {
+            "vm_id": name,
+            "name": name,
+            "cpu_cores": cpu_cores,
+            "memory_mb": memory_mb,
+            "image": image,
+            "power_state": "stopped",
+            "networks": [network],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def console_info(self, vm_id: str) -> dict[str, Any]:
+        display_uri = self._run(["domdisplay", vm_id])
+        m = re.search(r":(\d+)$", display_uri)
+        vnc_port = int(m.group(1)) if m else None
+        return {"display_uri": display_uri, "vnc_port": vnc_port}
 
     def resize(self, vm_id: str, cpu: int, mem_mb: int) -> None:
         self._run(["setvcpus", vm_id, str(cpu), "--live", "--config"])
