@@ -55,21 +55,23 @@ def render_dashboard_page(
         <meta name='viewport' content='width=device-width, initial-scale=1' />
         <title>KVM Dashboard - {config['title']}</title>
         <style>
-          :root {{ color-scheme: dark; --bg: #0b1020; --panel: #121a33; --muted: #8ea0c9; --text: #e6ecff; --border: #23325f; --primary:#2484ff; --ok:#23c552; --warn:#f5a524; --danger:#f31260; }}
-          body {{ margin: 0; font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background: radial-gradient(circle at 10% 10%, #172345, var(--bg)); color: var(--text); }}
-          .layout {{ display:grid; grid-template-columns:270px 1fr; min-height:100vh; }}
-          .sidebar {{ border-right:1px solid var(--border); padding:16px; background:#0c1430; }}
-          .brand {{ font-size:20px; font-weight:700; }}
+          :root {{ color-scheme: dark; --bg:#1f2633; --panel:#263145; --panel-2:#2d3a4f; --muted:#a9b6cc; --text:#ecf1fa; --border:#3a4a62; --primary:#3f8cff; --ok:#39b26b; --warn:#d39b34; --danger:#d85b67; }}
+          body {{ margin:0; font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background: var(--bg); color: var(--text); }}
+          .layout {{ display:grid; grid-template-columns:240px 1fr; min-height:100vh; }}
+          .sidebar {{ border-right:1px solid var(--border); padding:12px; background:#1b2330; }}
+          .brand {{ font-size:19px; font-weight:700; }}
           .sub {{ color:var(--muted); font-size:12px; margin:6px 0 12px; }}
           .nav-group {{ margin-bottom:14px; }}
           .nav-title {{ color:var(--muted); font-size:11px; text-transform:uppercase; margin-bottom:6px; }}
           .nav-link {{ display:block; color:#c9d5f7; text-decoration:none; padding:8px 10px; border-radius:8px; border:1px solid transparent; margin-bottom:6px; }}
-          .nav-link.active,.nav-link:hover {{ background:#15244c; border-color:#3552a3; }}
-          .content {{ padding:20px; }}
+          .nav-link.active,.nav-link:hover {{ background:#2a3a52; border-color:#4f6b8a; }}
+          .content {{ padding:0; }}
+          .headerbar {{ height:44px; display:flex; align-items:center; padding:0 14px; border-bottom:1px solid var(--border); background:#1a2330; color:#cbd6ea; font-size:13px; }}
+          .page {{ padding:16px; }}
           .toolbar {{ display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:14px; }}
           .search {{ background:#0f1a3b; border:1px solid #32498d; color:#dce7ff; border-radius:8px; padding:8px 10px; min-width:260px; }}
           .cards {{ display:grid; grid-template-columns: repeat(auto-fit,minmax(170px,1fr)); gap:12px; margin-bottom:14px; }}
-          .card {{ background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:12px; }}
+          .card {{ background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:10px; }}
           .muted {{ color:var(--muted); }}
           .btn {{ border:1px solid #2f5dad; background:#123777; color:#e8f2ff; padding:6px 10px; border-radius:8px; cursor:pointer; }}
           .btn.danger {{ border-color:#7e294f; background:#57243d; }}
@@ -89,13 +91,15 @@ def render_dashboard_page(
         <div class='layout'>
           <aside class='sidebar'>
             <div class='brand'>KVM Dashboard</div>
-            <div class='sub'>OpenShift-inspired operations view</div>
+            <div class='sub'>Proxmox-style operations view</div>
             {nav_html}
           </aside>
           <main class='content'>
+            <div class='headerbar'>Datacenter / Virtualization / {config['title']}</div>
+            <div class='page'>
             <div class='toolbar'>
               <div><h1 style='margin:0'>{config['title']}</h1><div class='muted'>{config['description']}</div></div>
-              <input id='search' class='search' placeholder='Filter table rows...' />
+              <div class='row'><span id='realtimeStatus' class='muted'>Realtime refresh: initializing…</span><input id='search' class='search' placeholder='Filter table rows...' /></div>
             </div>
             <div class='cards'>
               <div class='card'><strong>Hosts</strong><div>{stats['hosts']}</div></div>
@@ -106,6 +110,7 @@ def render_dashboard_page(
             <div class='card' id='actions'></div>
             <div class='card' style='margin-top:12px' id='content'></div>
             <div class='card' style='margin-top:12px'><strong>Platform Status</strong><ul>{diagnostics_html}</ul></div>
+            </div>
           </main>
         </div>
         <script>
@@ -204,7 +209,7 @@ def render_dashboard_page(
                 <input id='vmName' placeholder='VM name' />
                 <input id='vmCpu' type='number' value='2' min='1' style='width:80px' />
                 <input id='vmMem' type='number' value='2048' min='512' style='width:100px' />
-                <input id='vmImage' placeholder='qcow2 image' value='base.qcow2' />
+                <input id='vmImage' placeholder='base.qcow2' value='base.qcow2' />
                 <button class='btn' id='createVmBtn'>Create VM</button>
               </div>
               <div class='row'>
@@ -212,7 +217,35 @@ def render_dashboard_page(
                 <input id='impVmName' placeholder='Import VM name' />
                 <button class='btn' id='importVmBtn'>Import VM</button>
               </div>
-              <div class='muted'>All VM state, attachments, qcow2 mapping, and snapshots are loaded from live APIs.</div>`;
+              <div class='row'>
+                <input id='opVmId' placeholder='Target VM ID for day-2 ops' style='min-width:220px' />
+                <input id='opCpu' type='number' value='4' min='1' style='width:80px' />
+                <input id='opMem' type='number' value='4096' min='512' style='width:100px' />
+                <button class='btn' id='resizeVmBtn'>Resize CPU/Memory</button>
+                <input id='cloneName' placeholder='clone name' />
+                <button class='btn' id='cloneVmBtn'>Clone VM</button>
+              </div>
+              <div class='row'>
+                <input id='snapName' placeholder='snapshot name' value='pre-maintenance' />
+                <button class='btn' id='snapshotBtn'>Create Snapshot</button>
+                <input id='migHost' placeholder='target host id' />
+                <button class='btn' id='migrateBtn'>Migrate</button>
+                <button class='btn danger' id='deleteVmBtn'>Delete VM</button>
+              </div>
+              <div class='row'>
+                <input id='netId' placeholder='network id for attach/detach' style='min-width:220px' />
+                <button class='btn' id='attachNetBtn'>Attach Network</button>
+                <button class='btn warn' id='detachNetBtn'>Detach Network</button>
+                <input id='snapId' placeholder='snapshot id' style='min-width:180px' />
+                <button class='btn' id='revertSnapBtn'>Revert Snapshot</button>
+                <button class='btn danger' id='deleteSnapBtn'>Delete Snapshot</button>
+              </div>
+              <div class='row'>
+                <input id='isoPath' placeholder='/var/lib/libvirt/images/recovery.iso' style='min-width:320px' />
+                <button class='btn warn' id='attachIsoBtn'>Attach Recovery ISO</button>
+                <button class='btn' id='detachIsoBtn'>Detach Recovery ISO</button>
+              </div>
+              <div class='muted'>Live day-2 operations: power, resize, clone, migrate, snapshots (create/revert/delete), network attach/detach, delete, console, and recovery ISO workflows.</div>`;
             if (!hostId) {{
               content.innerHTML = "<div class='muted'>No hosts registered yet.</div>";
               return;
@@ -222,6 +255,7 @@ def render_dashboard_page(
               const att = (live.attachments || {{}})[vm.vm_id] || {{}};
               const snaps = (att.snapshots || []).length;
               return [
+                vm.vm_id,
                 vm.name,
                 vm.image,
                 vm.cpu_cores,
@@ -235,10 +269,12 @@ def render_dashboard_page(
                  <button class='btn warn' onclick="vmPower('${{vm.vm_id}}','pause','${{hostId}}')">Pause</button>
                  <button class='btn' onclick="vmPower('${{vm.vm_id}}','resume','${{hostId}}')">Resume</button>
                  <button class='btn' onclick="openConsole('${{vm.vm_id}}','${{hostId}}')">Console</button>
-                 <button class='btn' onclick="viewAttach('${{vm.vm_id}}','${{hostId}}')">Attachments</button>`
+                 <button class='btn' onclick="viewAttach('${{vm.vm_id}}','${{hostId}}')">Attachments</button>
+                 <button class='btn danger' onclick="deleteVm('${{vm.vm_id}}','${{hostId}}')">Delete</button>`
               ];
             }});
-            content.innerHTML = `<strong>VM inventory (live)</strong>${{table(['Name','Image','CPU','Memory MB','State','Networks','Snapshots','Actions'], rows)}}`;
+            content.innerHTML = `<strong>VM inventory (live)</strong>${{table(['VM ID','Name','Image','CPU','Memory MB','State','Networks','Snapshots','Actions'], rows)}}`;
+
             document.getElementById('createVmBtn').onclick = async () => {{
               await api('/api/v1/vms/provision', 'POST', {{
                 host_id: hostId,
@@ -266,6 +302,91 @@ def render_dashboard_page(
               }});
               loadVMs();
             }};
+
+            const opVmId = () => document.getElementById('opVmId').value.trim();
+            document.getElementById('resizeVmBtn').onclick = async () => {{
+              const vmId = opVmId();
+              if (!vmId) return alert('Provide VM ID');
+              await api(`/api/v1/vms/${{vmId}}/resize`, 'POST', {{ host_id: hostId, cpu_cores: Number(document.getElementById('opCpu').value), memory_mb: Number(document.getElementById('opMem').value) }});
+              await api('/api/v1/tasks/vm-operations', 'POST', {{ task_type: 'vm.resize', vm_id: vmId, host_id: hostId }});
+              loadVMs();
+            }};
+            document.getElementById('cloneVmBtn').onclick = async () => {{
+              const vmId = opVmId();
+              if (!vmId) return alert('Provide VM ID');
+              await api(`/api/v1/vms/${{vmId}}/clone`, 'POST', {{ host_id: hostId, name: document.getElementById('cloneName').value || `${{vmId}}-clone` }});
+              await api('/api/v1/tasks/vm-operations', 'POST', {{ task_type: 'vm.clone', vm_id: vmId, host_id: hostId }});
+              loadVMs();
+            }};
+            document.getElementById('snapshotBtn').onclick = async () => {{
+              const vmId = opVmId();
+              if (!vmId) return alert('Provide VM ID');
+              await api(`/api/v1/vms/${{vmId}}/snapshots`, 'POST', {{ host_id: hostId, name: document.getElementById('snapName').value || 'manual-snapshot' }});
+              await api('/api/v1/tasks/vm-operations', 'POST', {{ task_type: 'vm.snapshot', vm_id: vmId, host_id: hostId }});
+              loadVMs();
+            }};
+            document.getElementById('migrateBtn').onclick = async () => {{
+              const vmId = opVmId();
+              if (!vmId) return alert('Provide VM ID');
+              const targetHost = document.getElementById('migHost').value.trim();
+              if (!targetHost) return alert('Provide target host id');
+              await api(`/api/v1/vms/${{vmId}}/migrate`, 'POST', {{ source_host_id: hostId, target_host_id: targetHost }});
+              await api('/api/v1/tasks/vm-operations', 'POST', {{ task_type: 'vm.migrate', vm_id: vmId, host_id: hostId }});
+              loadVMs();
+            }};
+
+            document.getElementById('attachNetBtn').onclick = async () => {{
+              const vmId = opVmId();
+              const networkId = document.getElementById('netId').value.trim();
+              if (!vmId || !networkId) return alert('Provide VM ID and network ID');
+              await api(`/api/v1/networks/${{networkId}}/attach`, 'POST', {{ host_id: hostId, vm_id: vmId }});
+              await api('/api/v1/tasks/vm-operations', 'POST', {{ task_type: 'vm.network.attach', vm_id: vmId, host_id: hostId }});
+              loadVMs();
+            }};
+            document.getElementById('detachNetBtn').onclick = async () => {{
+              const vmId = opVmId();
+              const networkId = document.getElementById('netId').value.trim();
+              if (!vmId || !networkId) return alert('Provide VM ID and network ID');
+              await api(`/api/v1/networks/${{networkId}}/detach`, 'POST', {{ host_id: hostId, vm_id: vmId }});
+              await api('/api/v1/tasks/vm-operations', 'POST', {{ task_type: 'vm.network.detach', vm_id: vmId, host_id: hostId }});
+              loadVMs();
+            }};
+            document.getElementById('revertSnapBtn').onclick = async () => {{
+              const vmId = opVmId();
+              const snapshotId = document.getElementById('snapId').value.trim();
+              if (!vmId || !snapshotId) return alert('Provide VM ID and snapshot ID');
+              await api(`/api/v1/vms/${{vmId}}/snapshots/${{snapshotId}}/revert`, 'POST', {{ host_id: hostId }});
+              await api('/api/v1/tasks/vm-operations', 'POST', {{ task_type: 'vm.snapshot.revert', vm_id: vmId, host_id: hostId }});
+              loadVMs();
+            }};
+            document.getElementById('deleteSnapBtn').onclick = async () => {{
+              const vmId = opVmId();
+              const snapshotId = document.getElementById('snapId').value.trim();
+              if (!vmId || !snapshotId) return alert('Provide VM ID and snapshot ID');
+              await api(`/api/v1/vms/${{vmId}}/snapshots/${{snapshotId}}?host_id=${{encodeURIComponent(hostId)}}`, 'DELETE');
+              await api('/api/v1/tasks/vm-operations', 'POST', {{ task_type: 'vm.snapshot.delete', vm_id: vmId, host_id: hostId }});
+              loadVMs();
+            }};
+            document.getElementById('deleteVmBtn').onclick = async () => {{
+              const vmId = opVmId();
+              if (!vmId) return alert('Provide VM ID');
+              await deleteVm(vmId, hostId);
+            }};
+            document.getElementById('attachIsoBtn').onclick = async () => {{
+              const vmId = opVmId();
+              if (!vmId) return alert('Provide VM ID');
+              await api(`/api/v1/vms/${{vmId}}/recovery/attach-iso`, 'POST', {{ host_id: hostId, iso_path: document.getElementById('isoPath').value, boot_once: true }});
+              await api('/api/v1/tasks/vm-operations', 'POST', {{ task_type: 'vm.recovery.iso.attach', vm_id: vmId, host_id: hostId }});
+              loadVMs();
+            }};
+            document.getElementById('detachIsoBtn').onclick = async () => {{
+              const vmId = opVmId();
+              if (!vmId) return alert('Provide VM ID');
+              await api(`/api/v1/vms/${{vmId}}/recovery/detach-iso`, 'POST', {{ host_id: hostId }});
+              await api('/api/v1/tasks/vm-operations', 'POST', {{ task_type: 'vm.recovery.iso.detach', vm_id: vmId, host_id: hostId }});
+              loadVMs();
+            }};
+
             bindSearch();
             bindHostSelector('vmHostSelect', loadVMs);
           }}
@@ -273,6 +394,15 @@ def render_dashboard_page(
           window.vmPower = async (vmId, action, hostId) => {{
             try {{
               await api(`/api/v1/vms/${{vmId}}/action`, 'POST', {{ host_id: hostId, action }});
+              await api('/api/v1/tasks/vm-operations', 'POST', {{ task_type: `vm.${{action}}`, vm_id: vmId, host_id: hostId }});
+              loadVMs();
+            }} catch (e) {{ setError(e); }}
+          }};
+
+          window.deleteVm = async (vmId, hostId) => {{
+            try {{
+              await api(`/api/v1/vms/${{vmId}}?host_id=${{encodeURIComponent(hostId)}}`, 'DELETE');
+              await api('/api/v1/tasks/vm-operations', 'POST', {{ task_type: 'vm.delete', vm_id: vmId, host_id: hostId }});
               loadVMs();
             }} catch (e) {{ setError(e); }}
           }};
@@ -281,11 +411,13 @@ def render_dashboard_page(
             try {{
               const details = await api(`/api/v1/vms/${{vmId}}/attachments?host_id=${{encodeURIComponent(hostId)}}`);
               const att = details.attachments || {{}};
+              const vm = details.vm || {{}};
               alert(`VM: ${{vmId}}
 Image: ${{att.image?.name || 'n/a'}}
 Networks: ${{(att.networks || []).map(n => n.name || n.network_id || '-').join(', ') || '-'}}
 Snapshots: ${{(att.snapshots || []).length}}
-Volumes: ${{(att.volumes || []).map(v => v.name).join(', ') || '-'}}`);
+Volumes: ${{(att.volumes || []).map(v => v.name).join(', ') || '-'}}
+Recovery ISO: ${{vm.annotations?.['recovery.iso'] || 'not attached'}}`);
             }} catch (e) {{ setError(e); }}
           }};
 
@@ -378,10 +510,33 @@ Volumes: ${{(att.volumes || []).map(v => v.name).join(', ') || '-'}}`);
           }}
 
           async function loadTasks() {{
-            actions.innerHTML = `<strong>Task operations</strong><div class='muted'>Retry any task from the list.</div>`;
+            actions.innerHTML = `<strong>Task operations</strong>
+              <div class='row'>
+                <input id='taskVm' placeholder='vm id (optional)' />
+                <input id='taskHost' placeholder='host id (optional)' />
+                <select id='taskType'>
+                  <option value='vm.power_cycle'>VM power cycle</option>
+                  <option value='vm.snapshot'>VM snapshot</option>
+                  <option value='vm.clone'>VM clone</option>
+                  <option value='vm.migrate'>VM migrate</option>
+                  <option value='vm.resize'>VM resize</option>
+                  <option value='vm.backup'>VM backup</option>
+                </select>
+                <button class='btn' id='createTaskBtn'>Create Task</button>
+              </div>
+              <div class='muted'>Realtime operations queue for day-2 virtualization tasks.</div>`;
             const tasks = await api('/api/v1/tasks');
-            const rows = tasks.map(t => [t.task_id, t.task_type, t.status, t.target, `<button class='btn' onclick="retryTask('${{t.task_id}}')">Retry</button>`]);
-            content.innerHTML = `<strong>Tasks</strong>${{table(['Task ID','Type','Status','Target','Action'], rows)}}`;
+            const rows = tasks.map(t => [t.task_id, t.task_type, t.status, t.target, t.detail, `<button class='btn' onclick="retryTask('${{t.task_id}}')">Retry</button>`]);
+            content.innerHTML = `<strong>Tasks</strong>${{table(['Task ID','Type','Status','Target','Detail','Action'], rows)}}`;
+            document.getElementById('createTaskBtn').onclick = async () => {{
+              const payload = {{
+                task_type: document.getElementById('taskType').value,
+                vm_id: document.getElementById('taskVm').value || null,
+                host_id: document.getElementById('taskHost').value || null,
+              }};
+              await api('/api/v1/tasks/vm-operations', 'POST', payload);
+              loadTasks();
+            }};
             bindSearch();
           }}
 
@@ -398,18 +553,65 @@ Volumes: ${{(att.volumes || []).map(v => v.name).join(', ') || '-'}}`);
             bindSearch();
           }}
 
+          const loaders = {{
+            dashboard: loadOverview,
+            vms: loadVMs,
+            storage: loadStorage,
+            networks: loadNetworks,
+            images: loadImages,
+            console: loadConsole,
+            events: loadEvents,
+            tasks: loadTasks,
+            projects: () => loadSimple('/api/v1/projects', 'Projects', ['Project','Description','CPU quota','Memory quota','VM limit'], d => d.map(p => [p.name,p.description,p.cpu_cores_quota,p.memory_mb_quota,p.vm_limit])),
+            policies: () => loadSimple('/api/v1/policies', 'Policies', ['Name','Category','Created'], d => d.map(p => [p.name,p.category,p.created_at])),
+          }};
+
+          let refreshTimer = null;
+          const realtimePages = new Set(['dashboard','vms','storage','networks','images','console','events','tasks']);
+
+          function updateRealtimeStatus(msg) {{
+            const el = document.getElementById('realtimeStatus');
+            if (el) el.textContent = msg;
+          }}
+
+          function userEditing() {{
+            const active = document.activeElement;
+            if (!active) return false;
+            return ['INPUT', 'TEXTAREA', 'SELECT'].includes(active.tagName);
+          }}
+
+          async function refreshPage() {{
+            const loader = loaders[key];
+            if (!loader) return;
+            if (userEditing()) {{
+              updateRealtimeStatus(`Realtime refresh: paused while editing · ${{new Date().toLocaleTimeString()}}`);
+              return;
+            }}
+            await loader();
+            updateRealtimeStatus(`Realtime refresh: active · ${{new Date().toLocaleTimeString()}}`);
+          }}
+
+          function startAutoRefresh() {{
+            if (!realtimePages.has(key)) {{
+              updateRealtimeStatus('Realtime refresh: not required on this page');
+              return;
+            }}
+            if (refreshTimer) clearInterval(refreshTimer);
+            const intervalMs = key === 'tasks' ? 5000 : 10000;
+            refreshTimer = setInterval(async () => {{
+              try {{
+                if (document.hidden) return;
+                await refreshPage();
+              }} catch (err) {{
+                setError(err);
+              }}
+            }}, intervalMs);
+          }}
+
           async function boot() {{
             try {{
-              if (key === 'dashboard') return loadOverview();
-              if (key === 'vms') return loadVMs();
-              if (key === 'storage') return loadStorage();
-              if (key === 'networks') return loadNetworks();
-              if (key === 'images') return loadImages();
-              if (key === 'console') return loadConsole();
-              if (key === 'events') return loadEvents();
-              if (key === 'tasks') return loadTasks();
-              if (key === 'projects') return loadSimple('/api/v1/projects', 'Projects', ['Project','Description','CPU quota','Memory quota','VM limit'], d => d.map(p => [p.name,p.description,p.cpu_cores_quota,p.memory_mb_quota,p.vm_limit]));
-              if (key === 'policies') return loadSimple('/api/v1/policies', 'Policies', ['Name','Category','Created'], d => d.map(p => [p.name,p.category,p.created_at]));
+              await refreshPage();
+              startAutoRefresh();
             }} catch (err) {{ setError(err); }}
           }}
 
