@@ -1,5 +1,7 @@
 from datetime import datetime, timezone
+import json
 import os
+import time
 from typing import Any
 from uuid import uuid4
 from urllib.parse import urlencode
@@ -7,6 +9,7 @@ from urllib.parse import urlencode
 import requests
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from .db import get_db, init_db
@@ -52,6 +55,7 @@ app = FastAPI(title="KVM Dashboard API", version="0.7.1")
 
 AGENT_PORT = 9090
 AGENT_TIMEOUT_S = 10
+LIBVIRT_CACHE_TTL_S = int(os.getenv("LIBVIRT_CACHE_TTL_S", "15"))
 NOVNC_BASE_URL = os.getenv("NOVNC_BASE_URL", "/console/noVNC/viewer")
 NOVNC_WS_BASE = os.getenv("NOVNC_WS_BASE", "/console/noVNC/websockify")
 BASE_PATH = os.getenv("DASHBOARD_BASE_PATH", "").strip()
@@ -278,6 +282,71 @@ def _libvirt_call(host: Host, fn_name: str, *args):
     except LibvirtRemoteError as exc:
         raise HTTPException(status_code=502, detail=f"libvirt call failed: {exc}") from exc
 
+
+
+def _ensure_libvirt_cache_table(db: Session) -> None:
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS host_libvirt_cache (
+            host_id VARCHAR(128) PRIMARY KEY,
+            vms_json TEXT NOT NULL,
+            networks_json TEXT NOT NULL,
+            images_json TEXT NOT NULL,
+            pools_json TEXT NOT NULL,
+            updated_at DOUBLE PRECISION NOT NULL
+        )
+    """))
+    db.commit()
+
+
+def _refresh_host_cache(db: Session, host: Host) -> dict[str, Any]:
+    vms = _libvirt_call(host, "list_vms")
+    networks = _libvirt_call(host, "list_networks")
+    images = _libvirt_call(host, "list_images")
+    pools = _libvirt_call(host, "list_storage_pools")
+    now = time.time()
+    _ensure_libvirt_cache_table(db)
+    db.execute(
+        text("""
+            INSERT INTO host_libvirt_cache(host_id, vms_json, networks_json, images_json, pools_json, updated_at)
+            VALUES (:host_id, :vms_json, :networks_json, :images_json, :pools_json, :updated_at)
+            ON CONFLICT(host_id) DO UPDATE SET
+              vms_json=excluded.vms_json,
+              networks_json=excluded.networks_json,
+              images_json=excluded.images_json,
+              pools_json=excluded.pools_json,
+              updated_at=excluded.updated_at
+        """),
+        {
+            "host_id": host.host_id,
+            "vms_json": json.dumps(vms),
+            "networks_json": json.dumps(networks),
+            "images_json": json.dumps(images),
+            "pools_json": json.dumps(pools),
+            "updated_at": now,
+        },
+    )
+    db.commit()
+    return {"vms": vms, "networks": networks, "images": images, "pools": pools, "updated_at": now, "cache": "miss"}
+
+
+def _host_cached_state(db: Session, host: Host, *, force_refresh: bool = False) -> dict[str, Any]:
+    _ensure_libvirt_cache_table(db)
+    if not force_refresh:
+        row = db.execute(
+            text("SELECT vms_json, networks_json, images_json, pools_json, updated_at FROM host_libvirt_cache WHERE host_id=:host_id"),
+            {"host_id": host.host_id},
+        ).first()
+        if row and (time.time() - float(row.updated_at) <= LIBVIRT_CACHE_TTL_S):
+            return {
+                "vms": json.loads(row.vms_json),
+                "networks": json.loads(row.networks_json),
+                "images": json.loads(row.images_json),
+                "pools": json.loads(row.pools_json),
+                "updated_at": float(row.updated_at),
+                "cache": "hit",
+            }
+    return _refresh_host_cache(db, host)
+
 def _get_host_or_404(db: Session, host_id: str) -> Host:
     host = db.query(Host).filter(Host.host_id == host_id).first()
     if not host:
@@ -420,25 +489,24 @@ def import_vm(payload: VMImportRequest, db: Session = Depends(get_db)) -> dict:
 
 
 @app.get("/api/v1/hosts/{host_id}/vms")
-def list_host_vms(host_id: str, db: Session = Depends(get_db)) -> dict:
+def list_host_vms(host_id: str, refresh: bool = False, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, host_id)
-    vms = _libvirt_call(host, "list_vms")
-    return {"host_id": host_id, "vms": vms}
+    state = _host_cached_state(db, host, force_refresh=refresh)
+    return {"host_id": host_id, "vms": state["vms"], "cache": state["cache"], "cached_at": state["updated_at"]}
 
 
 @app.get("/api/v1/hosts/{host_id}/inventory-live")
-def host_inventory_live(host_id: str, db: Session = Depends(get_db)) -> dict:
+def host_inventory_live(host_id: str, refresh: bool = False, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, host_id)
-    vms = _libvirt_call(host, "list_vms")
-    networks = _libvirt_call(host, "list_networks")
-    images = _libvirt_call(host, "list_images")
+    state = _host_cached_state(db, host, force_refresh=refresh)
+    vms, networks, images = state["vms"], state["networks"], state["images"]
     vm_snapshots: dict[str, Any] = {}
     for vm in vms:
         vm_id = vm.get("vm_id")
         if vm_id:
             vm_snapshots[vm_id] = _libvirt_call(host, "snapshot_list", vm_id)
     attachments = {vm.get("vm_id"): {"networks": vm.get("networks", []), "image": {"name": vm.get("image")}, "snapshots": vm_snapshots.get(vm.get("vm_id"), [])} for vm in vms if vm.get("vm_id")}
-    return {"host_id": host_id, "state": {"vm_count": len(vms), "network_count": len(networks), "image_count": len(images), "snapshot_count": sum(len(items) for items in vm_snapshots.values())}, "vms": vms, "networks": networks, "images": images, "attachments": attachments}
+    return {"host_id": host_id, "cache": state["cache"], "cached_at": state["updated_at"], "state": {"vm_count": len(vms), "network_count": len(networks), "image_count": len(images), "snapshot_count": sum(len(items) for items in vm_snapshots.values())}, "vms": vms, "networks": networks, "images": images, "attachments": attachments}
 
 
 @app.get("/api/v1/vms/{vm_id}/attachments")
@@ -476,28 +544,21 @@ def vm_attachments(vm_id: str, host_id: str, db: Session = Depends(get_db)) -> d
 def vm_action(vm_id: str, payload: VMHostActionRequest, db: Session = Depends(get_db)) -> dict:
     _enforce_policies(f"vm.action.{payload.action.value}", host_id=payload.host_id)
     host = _get_host_or_404(db, payload.host_id)
-    url = f"{_agent_base_url(host)}/agent/vms/{vm_id}/action"
-    try:
-        response = requests.post(url, json={"action": payload.action.value}, timeout=AGENT_TIMEOUT_S)
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"agent request failed: {exc}") from exc
-
+    _libvirt_call(host, "vm_action", vm_id, payload.action.value)
+    state = _refresh_host_cache(db, host)
+    vm = next((item for item in state["vms"] if item.get("vm_id") == vm_id), None)
+    if not vm:
+        raise HTTPException(status_code=404, detail="vm not found")
     _record_event("vm.action", f"vm {vm_id} action={payload.action.value} on host {payload.host_id}")
-    return {"host_id": payload.host_id, "vm": response.json()}
+    return {"host_id": payload.host_id, "vm": vm}
 
 
 @app.delete("/api/v1/vms/{vm_id}")
 def delete_vm(vm_id: str, host_id: str, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, host_id)
-    url = f"{_agent_base_url(host)}/agent/vms/{vm_id}"
-    try:
-        response = requests.delete(url, timeout=AGENT_TIMEOUT_S)
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"agent request failed: {exc}") from exc
-
-    return {"host_id": host_id, "result": response.json()}
+    _libvirt_call(host, "delete_vm", vm_id)
+    _refresh_host_cache(db, host)
+    return {"host_id": host_id, "result": {"status": "deleted", "vm_id": vm_id}}
 
 
 @app.post("/api/v1/networks")
@@ -519,9 +580,10 @@ def create_network(payload: NetworkCreateRequest, db: Session = Depends(get_db))
 
 
 @app.get("/api/v1/hosts/{host_id}/networks")
-def list_host_networks(host_id: str, db: Session = Depends(get_db)) -> dict:
+def list_host_networks(host_id: str, refresh: bool = False, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, host_id)
-    return {"host_id": host_id, "networks": _libvirt_call(host, "list_networks")}
+    state = _host_cached_state(db, host, force_refresh=refresh)
+    return {"host_id": host_id, "networks": state["networks"], "cache": state["cache"], "cached_at": state["updated_at"]}
 
 
 @app.post("/api/v1/networks/{network_id}/attach")
@@ -542,7 +604,8 @@ def delete_network(network_id: str, host_id: str, db: Session = Depends(get_db))
 def resize_vm(vm_id: str, payload: VMResizeRequest, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, payload.host_id)
     _libvirt_call(host, "resize", vm_id, payload.cpu_cores, payload.memory_mb)
-    vm = next((item for item in _libvirt_call(host, "list_vms") if item.get("vm_id") == vm_id), None)
+    state = _refresh_host_cache(db, host)
+    vm = next((item for item in state["vms"] if item.get("vm_id") == vm_id), None)
     if not vm:
         raise HTTPException(status_code=404, detail="vm not found")
     _record_event("vm.resize", f"vm {vm_id} resized on host {payload.host_id}")
@@ -605,6 +668,7 @@ def migrate_vm(vm_id: str, payload: VMMigrateRequest, db: Session = Depends(get_
 def create_snapshot(vm_id: str, payload: VMSnapshotCreateRequest, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, payload.host_id)
     snap = _libvirt_call(host, "snapshot_create", vm_id, payload.name)
+    _refresh_host_cache(db, host)
     return {"host_id": payload.host_id, "snapshot": snap}
 
 
@@ -618,7 +682,8 @@ def list_snapshots(vm_id: str, host_id: str, db: Session = Depends(get_db)) -> d
 def revert_snapshot(vm_id: str, snapshot_id: str, payload: VMSnapshotHostRequest, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, payload.host_id)
     _libvirt_call(host, "snapshot_revert", vm_id, snapshot_id)
-    vm = next((item for item in _libvirt_call(host, "list_vms") if item.get("vm_id") == vm_id), None)
+    state = _refresh_host_cache(db, host)
+    vm = next((item for item in state["vms"] if item.get("vm_id") == vm_id), None)
     if not vm:
         raise HTTPException(status_code=404, detail="vm not found")
     return {"host_id": payload.host_id, "vm": vm}
@@ -628,6 +693,7 @@ def revert_snapshot(vm_id: str, snapshot_id: str, payload: VMSnapshotHostRequest
 def delete_snapshot(vm_id: str, snapshot_id: str, host_id: str, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, host_id)
     _libvirt_call(host, "snapshot_delete", vm_id, snapshot_id)
+    _refresh_host_cache(db, host)
     return {"host_id": host_id, "result": {"status": "deleted", "snapshot_id": snapshot_id, "vm_id": vm_id}}
 
 
@@ -664,16 +730,17 @@ def api_backbone_check(db: Session = Depends(get_db)) -> dict:
 
 
 @app.get("/api/v1/hosts/{host_id}/images")
-def list_host_images(host_id: str, db: Session = Depends(get_db)) -> dict:
+def list_host_images(host_id: str, refresh: bool = False, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, host_id)
-    return {"host_id": host_id, "images": _libvirt_call(host, "list_images")}
+    state = _host_cached_state(db, host, force_refresh=refresh)
+    return {"host_id": host_id, "images": state["images"], "cache": state["cache"], "cached_at": state["updated_at"]}
 
 
 @app.get("/api/v1/hosts/{host_id}/storage-pools")
-def list_storage_pools(host_id: str, db: Session = Depends(get_db)) -> dict:
+def list_storage_pools(host_id: str, refresh: bool = False, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, host_id)
-    pools = _libvirt_call(host, "list_storage_pools")
-    return {"host_id": host_id, "storage_pools": pools}
+    state = _host_cached_state(db, host, force_refresh=refresh)
+    return {"host_id": host_id, "storage_pools": state["pools"], "cache": state["cache"], "cached_at": state["updated_at"]}
 
 
 @app.post("/api/v1/images")

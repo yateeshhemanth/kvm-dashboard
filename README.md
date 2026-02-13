@@ -686,3 +686,17 @@ Example:
 export NOVNC_BASE_URL=https://novnc.example.com/vnc.html
 export NOVNC_WS_BASE=wss://novnc.example.com/websockify
 ```
+
+
+## Libvirt query cache (PostgreSQL-backed)
+
+To reduce repeated `virsh` process spawning and PID pressure on hosts/containers, dashboard now caches per-host VM/network/image/storage snapshots in PostgreSQL table `host_libvirt_cache`.
+
+- Cache TTL env: `LIBVIRT_CACHE_TTL_S` (default: `15`)
+- Endpoints support `?refresh=true` to force recrawl from libvirt.
+
+This improves UI responsiveness while keeping operations functional (power, resize, snapshots, console ticket, etc.).
+
+
+### Direct architecture
+Dashboard (10.110.17.160) connects directly to registered hosts using each host `libvirt_uri` such as `qemu+ssh://root@10.110.17.153/system`. No host-agent process is required on `.153` for core operations. Multiple hosts are supported by adding multiple host records.
