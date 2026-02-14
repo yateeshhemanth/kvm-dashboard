@@ -7,7 +7,7 @@ services:
       POSTGRES_USER: kvm
       POSTGRES_PASSWORD: kvm
     volumes:
-      - ./postgres-data:/var/lib/postgresql/data
+      - ./postgres-data:/var/lib/postgresql/data:z
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U kvm -d kvm_dashboard"]
       interval: 10s
@@ -23,6 +23,8 @@ services:
       DATABASE_URL: postgresql+psycopg://kvm:kvm@postgres:5432/kvm_dashboard
     volumes:
       - /root/.ssh:/root/.ssh:ro,z
+      - /var/run/libvirt:/var/run/libvirt:z
     depends_on:
       postgres:
         condition: service_healthy
+    privileged: true

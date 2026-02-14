@@ -83,6 +83,11 @@ def render_dashboard_page(
           .pill.stopped {{ background: rgba(122,130,148,.2); color:#b6c0d4; }}
           .pill.paused {{ background: rgba(245,165,36,.2); color:#ffd277; }}
           .error {{ color:#ff9cbc; }}
+          .console-modal {{ position:fixed; inset:0; background:rgba(4,9,20,.75); display:none; align-items:center; justify-content:center; z-index:9999; }}
+          .console-modal.open {{ display:flex; }}
+          .console-shell {{ width:min(1200px,96vw); height:min(780px,92vh); background:#0d1526; border:1px solid #38507a; border-radius:10px; overflow:hidden; display:flex; flex-direction:column; }}
+          .console-head {{ display:flex; justify-content:space-between; align-items:center; padding:8px 10px; border-bottom:1px solid #263b61; background:#111c33; }}
+          .console-frame {{ width:100%; height:100%; border:0; background:#000; }}
         </style>
       </head>
       <body>
@@ -110,6 +115,20 @@ def render_dashboard_page(
             </div>
           </main>
         </div>
+
+        <div id='consoleModal' class='console-modal'>
+          <div class='console-shell'>
+            <div class='console-head'>
+              <strong id='consoleTitle'>VM Console</strong>
+              <div class='row' style='margin:0'>
+                <button class='btn' id='consolePopoutBtn'>Pop out</button>
+                <button class='btn danger' id='consoleCloseBtn'>Close</button>
+              </div>
+            </div>
+            <iframe id='consoleFrame' class='console-frame' loading='eager' referrerpolicy='no-referrer'></iframe>
+          </div>
+        </div>
+
         <script>
           const key = {page_key!r};
           const base = {base_path!r};
@@ -117,6 +136,29 @@ def render_dashboard_page(
           const actions = document.getElementById('actions');
           const searchInput = document.getElementById('search');
           let currentRows = [];
+          let consoleLastUrl = '';
+
+          function showConsole(url, title='VM Console') {{
+            const modal = document.getElementById('consoleModal');
+            const frame = document.getElementById('consoleFrame');
+            const titleEl = document.getElementById('consoleTitle');
+            if (!modal || !frame || !titleEl) return;
+            titleEl.textContent = title;
+            if (consoleLastUrl !== url) {{
+              frame.src = url;
+              consoleLastUrl = url;
+            }}
+            modal.classList.add('open');
+          }}
+
+          function closeConsole() {{
+            const modal = document.getElementById('consoleModal');
+            const frame = document.getElementById('consoleFrame');
+            if (!modal || !frame) return;
+            modal.classList.remove('open');
+            frame.src = 'about:blank';
+            consoleLastUrl = '';
+          }}
 
           async function api(path, method='GET', body=null) {{
             const resp = await fetch((base || '') + path, {{
@@ -423,7 +465,7 @@ Recovery ISO: ${{vm.annotations?.['recovery.iso'] || 'not attached'}}`);
           window.openConsole = async (vmId, hostId) => {{
             try {{
               const c = await api(`/api/v1/vms/${{vmId}}/console?host_id=${{encodeURIComponent(hostId)}}`);
-              window.open(c.noVNC_url, '_blank');
+              showConsole(c.noVNC_url, `Console · ${{vmId}}@${{hostId}}`);
             }} catch (e) {{ setError(e); }}
           }};
 
@@ -505,7 +547,7 @@ Recovery ISO: ${{vm.annotations?.['recovery.iso'] || 'not attached'}}`);
               if (!hostId) return;
               const vmId = document.getElementById('conVm').value;
               const t = await api(`/api/v1/vms/${{vmId}}/console?host_id=${{encodeURIComponent(hostId)}}`);
-              window.open(t.noVNC_url, '_blank');
+              showConsole(t.noVNC_url, `Console · ${{vmId}}@${{hostId}}`);
             }};
             bindSearch();
             bindHostSelector('consoleHostSelect', loadConsole);
@@ -630,7 +672,7 @@ Recovery ISO: ${{vm.annotations?.['recovery.iso'] || 'not attached'}}`);
               return;
             }}
             if (refreshTimer) clearInterval(refreshTimer);
-            const intervalMs = key === 'tasks' ? 5000 : 10000;
+            const intervalMs = key === 'tasks' ? 5000 : (key === 'console' ? 20000 : 10000);
             refreshTimer = setInterval(async () => {{
               try {{
                 if (document.hidden) return;
@@ -642,6 +684,12 @@ Recovery ISO: ${{vm.annotations?.['recovery.iso'] || 'not attached'}}`);
           }}
 
           async function boot() {{
+            const closeBtn = document.getElementById('consoleCloseBtn');
+            const popBtn = document.getElementById('consolePopoutBtn');
+            const modal = document.getElementById('consoleModal');
+            if (closeBtn) closeBtn.onclick = closeConsole;
+            if (modal) modal.onclick = (e) => {{ if (e.target === modal) closeConsole(); }};
+            if (popBtn) popBtn.onclick = () => {{ if (consoleLastUrl) window.open(consoleLastUrl, '_blank'); }};
             try {{
               await refreshPage();
               startAutoRefresh();
