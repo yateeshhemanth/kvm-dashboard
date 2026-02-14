@@ -75,6 +75,9 @@ def render_dashboard_page(
           .btn.danger {{ border-color:#7e294f; background:#57243d; }}
           .btn.warn {{ border-color:#8c5e1c; background:#6b4a1d; }}
           .row {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }}
+          .op-grid {{ display:grid; gap:10px; grid-template-columns: repeat(auto-fit,minmax(330px,1fr)); margin-top:8px; }}
+          .op-card {{ border:1px solid #334a72; background:#1a2740; border-radius:8px; padding:10px; }}
+          .op-card h4 {{ margin:0 0 8px; font-size:13px; color:#dbe7ff; }}
           input, select {{ background:#0f1a3b; border:1px solid #2a447f; color:#dce7ff; border-radius:8px; padding:7px 9px; }}
           table {{ width:100%; border-collapse:collapse; margin-top:8px; }}
           th, td {{ border-bottom:1px solid #22325c; padding:8px; text-align:left; font-size:13px; }}
@@ -254,45 +257,56 @@ def render_dashboard_page(
             const {{ hosts, hostId }} = await pickSelectedHostId();
             actions.innerHTML = `<strong>VM operations</strong>
               <div class='row'>${{renderHostSelector(hosts, hostId, 'vmHostSelect')}}</div>
-              <div class='row'>
-                <input id='vmName' placeholder='VM name' />
-                <input id='vmCpu' type='number' value='2' min='1' style='width:80px' />
-                <input id='vmMem' type='number' value='2048' min='512' style='width:100px' />
-                <input id='vmImage' placeholder='base.qcow2' value='base.qcow2' />
-                <button class='btn' id='createVmBtn'>Create VM</button>
-              </div>
-              <div class='row'>
-                <input id='impVmId' placeholder='Import VM ID' />
-                <input id='impVmName' placeholder='Import VM name' />
-                <button class='btn' id='importVmBtn'>Import VM</button>
-              </div>
-              <div class='row'>
-                <input id='opVmId' placeholder='Target VM ID for day-2 ops' style='min-width:220px' />
-                <input id='opCpu' type='number' value='4' min='1' style='width:80px' />
-                <input id='opMem' type='number' value='4096' min='512' style='width:100px' />
-                <button class='btn' id='resizeVmBtn'>Resize CPU/Memory</button>
-                <input id='cloneName' placeholder='clone name' />
-                <button class='btn' id='cloneVmBtn'>Clone VM</button>
-              </div>
-              <div class='row'>
-                <input id='snapName' placeholder='snapshot name' value='pre-maintenance' />
-                <button class='btn' id='snapshotBtn'>Create Snapshot</button>
-                <input id='migHost' placeholder='target host id' />
-                <button class='btn' id='migrateBtn'>Migrate</button>
-                <button class='btn danger' id='deleteVmBtn'>Delete VM</button>
-              </div>
-              <div class='row'>
-                <input id='netId' placeholder='network id for attach/detach' style='min-width:220px' />
-                <button class='btn' id='attachNetBtn'>Attach Network</button>
-                <button class='btn warn' id='detachNetBtn'>Detach Network</button>
-                <input id='snapId' placeholder='snapshot id' style='min-width:180px' />
-                <button class='btn' id='revertSnapBtn'>Revert Snapshot</button>
-                <button class='btn danger' id='deleteSnapBtn'>Delete Snapshot</button>
-              </div>
-              <div class='row'>
-                <input id='isoPath' placeholder='/var/lib/libvirt/images/recovery.iso' style='min-width:320px' />
-                <button class='btn warn' id='attachIsoBtn'>Attach Recovery ISO</button>
-                <button class='btn' id='detachIsoBtn'>Detach Recovery ISO</button>
+              <div class='op-grid'>
+                <div class='op-card'>
+                  <h4>Provision / Import</h4>
+                  <div class='row'>
+                    <input id='vmName' placeholder='VM name' />
+                    <input id='vmCpu' type='number' value='2' min='1' style='width:80px' />
+                    <input id='vmMem' type='number' value='2048' min='512' style='width:100px' />
+                    <input id='vmImage' placeholder='base.qcow2 or pool::volume' value='base.qcow2' />
+                    <button class='btn' id='createVmBtn'>Create VM</button>
+                  </div>
+                  <div class='row'>
+                    <input id='impVmId' placeholder='Import VM ID' />
+                    <input id='impVmName' placeholder='Import VM name' />
+                    <button class='btn' id='importVmBtn'>Import VM</button>
+                  </div>
+                </div>
+                <div class='op-card'>
+                  <h4>Day-2 Compute</h4>
+                  <div class='row'>
+                    <input id='opVmId' placeholder='Target VM ID for day-2 ops' style='min-width:220px' />
+                    <input id='opCpu' type='number' value='4' min='1' style='width:80px' />
+                    <input id='opMem' type='number' value='4096' min='512' style='width:100px' />
+                    <button class='btn' id='resizeVmBtn'>Resize CPU/Memory</button>
+                    <input id='cloneName' placeholder='clone name' />
+                    <button class='btn' id='cloneVmBtn'>Clone VM</button>
+                  </div>
+                  <div class='row'>
+                    <input id='snapName' placeholder='snapshot name' value='pre-maintenance' />
+                    <button class='btn' id='snapshotBtn'>Create Snapshot</button>
+                    <input id='migHost' placeholder='target host id' />
+                    <button class='btn' id='migrateBtn'>Migrate</button>
+                    <button class='btn danger' id='deleteVmBtn'>Delete VM</button>
+                  </div>
+                </div>
+                <div class='op-card'>
+                  <h4>Network / Snapshot / Recovery ISO</h4>
+                  <div class='row'>
+                    <input id='netId' placeholder='network id for attach/detach' style='min-width:220px' />
+                    <button class='btn' id='attachNetBtn'>Attach Network</button>
+                    <button class='btn warn' id='detachNetBtn'>Detach Network</button>
+                    <input id='snapId' placeholder='snapshot id' style='min-width:180px' />
+                    <button class='btn' id='revertSnapBtn'>Revert Snapshot</button>
+                    <button class='btn danger' id='deleteSnapBtn'>Delete Snapshot</button>
+                  </div>
+                  <div class='row'>
+                    <input id='isoPath' placeholder='/var/lib/libvirt/images/recovery.iso' style='min-width:320px' />
+                    <button class='btn warn' id='attachIsoBtn'>Attach Recovery ISO</button>
+                    <button class='btn' id='detachIsoBtn'>Detach Recovery ISO</button>
+                  </div>
+                </div>
               </div>
               <div class='muted'>Live day-2 operations: power, resize, clone, migrate, snapshots (create/revert/delete), network attach/detach, delete, console, and recovery ISO workflows.</div>`;
             if (!hostId) {{

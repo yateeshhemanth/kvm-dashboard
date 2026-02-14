@@ -4,7 +4,7 @@ from typing import Any
 from uuid import uuid4
 from urllib.parse import urlencode
 
-from fastapi import Depends, FastAPI, Form, HTTPException, Request
+from fastapi import Depends, FastAPI, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
@@ -220,6 +220,33 @@ def _require_roles(request: Request, allowed: set[str]) -> str:
     if role not in allowed:
         raise HTTPException(status_code=403, detail=f"rbac denied for role={role}; allowed={sorted(allowed)}")
     return role
+def _tags_to_csv(tags: list[str] | None) -> str:
+    if not tags:
+        return ""
+    return ",".join(sorted({t.strip() for t in tags if t and t.strip()}))
+
+
+def _csv_to_tags(tags_csv: str | None) -> list[str]:
+    if not tags_csv:
+        return []
+    return [item.strip() for item in tags_csv.split(",") if item.strip()]
+
+
+def _host_to_response(host: Host) -> HostResponse:
+    return HostResponse(
+        host_id=host.host_id,
+        name=host.name,
+        address=host.address,
+        status=host.status,
+        cpu_cores=host.cpu_cores,
+        memory_mb=host.memory_mb,
+        libvirt_uri=host.libvirt_uri,
+        tags=_csv_to_tags(getattr(host, "tags", "")),
+        project_id=getattr(host, "project_id", None),
+        last_heartbeat=host.last_heartbeat,
+    )
+
+
 def _project_quota_summary() -> tuple[int, int, int]:
     total_cpu = sum(project.cpu_cores_quota for project in PROJECTS.values())
     total_memory = sum(project.memory_mb_quota for project in PROJECTS.values())
@@ -234,6 +261,9 @@ def startup() -> None:
     try:
         db = next(db_gen)
         CACHE_STORE.ensure_table(db)
+        db.execute(text("ALTER TABLE hosts ADD COLUMN IF NOT EXISTS tags VARCHAR(1024) DEFAULT ''"))
+        db.execute(text("ALTER TABLE hosts ADD COLUMN IF NOT EXISTS project_id VARCHAR(128)"))
+        db.commit()
         ensure_default_admin(db)
     except Exception:
         pass
@@ -376,6 +406,8 @@ def register_host(payload: HostRegisterRequest, db: Session = Depends(get_db)) -
         host.cpu_cores = payload.cpu_cores
         host.memory_mb = payload.memory_mb
         host.libvirt_uri = payload.libvirt_uri
+        host.tags = _tags_to_csv(payload.tags)
+        host.project_id = payload.project_id
         host.status = "registered"
         host.last_heartbeat = datetime.now(timezone.utc)
     else:
@@ -387,13 +419,15 @@ def register_host(payload: HostRegisterRequest, db: Session = Depends(get_db)) -
             cpu_cores=payload.cpu_cores,
             memory_mb=payload.memory_mb,
             libvirt_uri=payload.libvirt_uri,
+            tags=_tags_to_csv(payload.tags),
+            project_id=payload.project_id,
             last_heartbeat=datetime.now(timezone.utc),
         )
         db.add(host)
 
     db.commit()
     db.refresh(host)
-    return host
+    return _host_to_response(host)
 
 
 @app.post("/api/v1/hosts/{host_id}/heartbeat", response_model=HostResponse)
@@ -405,7 +439,7 @@ def heartbeat(host_id: str, payload: HeartbeatRequest, db: Session = Depends(get
     host.last_heartbeat = datetime.now(timezone.utc)
     db.commit()
     db.refresh(host)
-    return host
+    return _host_to_response(host)
 
 
 @app.post("/api/v1/hosts/{host_id}/action", response_model=HostResponse)
@@ -415,7 +449,7 @@ def host_action(host_id: str, payload: HostActionRequest, db: Session = Depends(
     host.last_heartbeat = datetime.now(timezone.utc)
     db.commit()
     db.refresh(host)
-    return host
+    return _host_to_response(host)
 
 
 @app.delete("/api/v1/hosts/{host_id}")
@@ -427,8 +461,15 @@ def remove_host(host_id: str, db: Session = Depends(get_db)) -> dict[str, str]:
 
 
 @app.get("/api/v1/hosts", response_model=list[HostResponse])
-def list_hosts(db: Session = Depends(get_db)) -> list[Host]:
-    return db.query(Host).order_by(Host.id.desc()).all()
+def list_hosts(project_id: str | None = Query(default=None), tag: str | None = Query(default=None), db: Session = Depends(get_db)) -> list[HostResponse]:
+    query = db.query(Host)
+    if project_id:
+        query = query.filter(Host.project_id == project_id)
+    hosts = query.order_by(Host.id.desc()).all()
+    if tag:
+        token = tag.strip().lower()
+        hosts = [h for h in hosts if token in {t.lower() for t in _csv_to_tags(getattr(h, "tags", ""))}]
+    return [_host_to_response(h) for h in hosts]
 
 
 @app.post("/api/v1/vms/provision")

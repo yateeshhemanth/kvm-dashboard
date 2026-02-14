@@ -721,6 +721,8 @@ To reduce repeated `virsh` process spawning and PID pressure on hosts/containers
 - Console ticket reuse TTL env: `CONSOLE_SESSION_TTL_S` (default: `30`)
 - Max concurrent virsh commands env: `LIBVIRT_MAX_CONCURRENCY` (default: `2`)
 - Fork retry tuning envs: `LIBVIRT_FORK_RETRY_COUNT` (default: `2`), `LIBVIRT_FORK_RETRY_SLEEP_S` (default: `0.25`)
+- Default pool for plain image names in VM create: `LIBVIRT_DEFAULT_POOL` (default: `default`)
+- Host register now accepts optional `tags` and `project_id` (and `/api/v1/hosts` supports filtering via `?project_id=` and `?tag=`).
 - Endpoints support `?refresh=true` to force recrawl from libvirt.
 
 This improves UI responsiveness while keeping operations functional (power, resize, snapshots, console ticket, etc.).

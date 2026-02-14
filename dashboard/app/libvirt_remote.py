@@ -26,6 +26,7 @@ class LibvirtRemote:
         self.max_concurrency = max(1, int(os.getenv("LIBVIRT_MAX_CONCURRENCY", "2")))
         self.retry_count = max(0, int(os.getenv("LIBVIRT_FORK_RETRY_COUNT", "2")))
         self.retry_sleep_s = max(0.0, float(os.getenv("LIBVIRT_FORK_RETRY_SLEEP_S", "0.25")))
+        self.default_pool = os.getenv("LIBVIRT_DEFAULT_POOL", "default").strip() or "default"
 
     @classmethod
     def _get_semaphore(cls, size: int) -> threading.BoundedSemaphore:
@@ -125,7 +126,11 @@ class LibvirtRemote:
                     return ""
         if image.startswith("/"):
             return image
-        return ""
+        # Fallback: treat plain image names as volumes in default pool.
+        try:
+            return self._run(["vol-path", image, "--pool", self.default_pool])
+        except LibvirtRemoteError:
+            return ""
 
     def create_vm(self, name: str, cpu_cores: int, memory_mb: int, image: str, network: str = "default") -> dict[str, Any]:
         disk_path = self._disk_source_from_image(image)
