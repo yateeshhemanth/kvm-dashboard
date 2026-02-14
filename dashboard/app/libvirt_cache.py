@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from typing import Any, Callable
@@ -15,6 +16,7 @@ from .models import Host
 class LibvirtCacheStore:
     def __init__(self, ttl_s: int) -> None:
         self.ttl_s = ttl_s
+        self.refresh_on_stale = os.getenv("LIBVIRT_REFRESH_ON_STALE", "false").strip().lower() in {"1","true","yes","on"}
         self._schema_checked = False
         self._schema_lock = threading.Lock()
 
@@ -78,6 +80,11 @@ class LibvirtCacheStore:
         db.commit()
         return {"vms": vms, "networks": networks, "images": images, "pools": pools, "updated_at": now, "cache": "miss"}
 
+    def invalidate(self, db: Session, host_id: str) -> None:
+        self.ensure_table(db)
+        db.execute(text("UPDATE host_libvirt_cache SET updated_at=0 WHERE host_id=:host_id"), {"host_id": host_id})
+        db.commit()
+
     def get(self, db: Session, host: Host, fetcher: Callable[[Host, str], Any], *, force_refresh: bool = False) -> dict[str, Any]:
         self.ensure_table(db)
         row = db.execute(
@@ -85,16 +92,41 @@ class LibvirtCacheStore:
             {"host_id": host.host_id},
         ).first()
 
-        if not force_refresh and row and (time.time() - float(row.updated_at) <= self.ttl_s):
+        if row and not force_refresh:
+            age_s = time.time() - float(row.updated_at)
+            if age_s <= self.ttl_s:
+                return {
+                    "vms": json.loads(row.vms_json),
+                    "networks": json.loads(row.networks_json),
+                    "images": json.loads(row.images_json),
+                    "pools": json.loads(row.pools_json),
+                    "updated_at": float(row.updated_at),
+                    "last_error": row.last_error,
+                    "last_success_at": float(row.last_success_at) if row.last_success_at else None,
+                    "cache": "hit",
+                }
+            if not self.refresh_on_stale:
+                return {
+                    "vms": json.loads(row.vms_json),
+                    "networks": json.loads(row.networks_json),
+                    "images": json.loads(row.images_json),
+                    "pools": json.loads(row.pools_json),
+                    "updated_at": float(row.updated_at),
+                    "last_error": row.last_error,
+                    "last_success_at": float(row.last_success_at) if row.last_success_at else None,
+                    "cache": "stale",
+                }
+
+        if not row and not force_refresh:
             return {
-                "vms": json.loads(row.vms_json),
-                "networks": json.loads(row.networks_json),
-                "images": json.loads(row.images_json),
-                "pools": json.loads(row.pools_json),
-                "updated_at": float(row.updated_at),
-                "last_error": row.last_error,
-                "last_success_at": float(row.last_success_at) if row.last_success_at else None,
-                "cache": "hit",
+                "vms": [],
+                "networks": [],
+                "images": [],
+                "pools": [],
+                "updated_at": time.time(),
+                "last_error": "cache empty; use refresh=true to query libvirt",
+                "last_success_at": None,
+                "cache": "empty",
             }
 
         try:

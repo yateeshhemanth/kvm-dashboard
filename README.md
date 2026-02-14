@@ -727,6 +727,8 @@ To reduce repeated `virsh` process spawning and PID pressure on hosts/containers
 - Default pool for plain image names in VM create: `LIBVIRT_DEFAULT_POOL` (default: `default`)
 - Host register now accepts optional `tags` and `project_id` (and `/api/v1/hosts` supports filtering via `?project_id=` and `?tag=`).
 - Endpoints support `?refresh=true` to force recrawl from libvirt.
+- VM provision API now supports optional `disk_path`, `cdrom`, `disk_size_gb`, and `enable_guest_agent` to align with `virt-install` style workflows.
+- UI inventory pages are cache-first with manual refresh button to minimize SSH/libvirt fork load on KVM hosts.
 
 This improves UI responsiveness while keeping operations functional (power, resize, snapshots, console ticket, etc.).
 
@@ -740,3 +742,11 @@ Dashboard (10.110.17.160) connects directly to registered hosts using each host 
 - UI route: `/guide`
 - API source: `GET /api/v1/operations-guide`
 - Contains step-by-step usage for host registration, VM lifecycle, network/storage/image, console, events, and tasks.
+
+
+### Manual refresh mode (libvirt load control)
+
+- UI now prefers PostgreSQL cache for inventory pages by default.
+- Use **Refresh from libvirt** button in the dashboard toolbar to force live libvirt polling (`refresh=true`).
+- Cache behavior is controlled by `LIBVIRT_CACHE_TTL_S` and `LIBVIRT_REFRESH_ON_STALE` (set false to avoid automatic stale refresh).
+

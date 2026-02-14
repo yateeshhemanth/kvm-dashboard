@@ -339,6 +339,10 @@ def _refresh_host_cache(db: Session, host: Host) -> dict[str, Any]:
     return CACHE_STORE.refresh(db, host, _libvirt_call)
 
 
+def _mark_host_cache_stale(db: Session, host: Host) -> None:
+    CACHE_STORE.invalidate(db, host.host_id)
+
+
 def _host_cached_state(db: Session, host: Host, *, force_refresh: bool = False) -> dict[str, Any]:
     return CACHE_STORE.get(db, host, _libvirt_call, force_refresh=force_refresh)
 
@@ -474,8 +478,8 @@ def list_hosts(project_id: str | None = Query(default=None), tag: str | None = Q
 def provision_vm(payload: VMProvisionRequest, db: Session = Depends(get_db)) -> dict:
     _enforce_policies("vm.provision", host_id=payload.host_id)
     host = _get_host_or_404(db, payload.host_id)
-    vm = _libvirt_call(host, "create_vm", payload.name, payload.cpu_cores, payload.memory_mb, payload.image, payload.network)
-    _refresh_host_cache(db, host)
+    vm = _libvirt_call(host, "create_vm", payload.name, payload.cpu_cores, payload.memory_mb, payload.image, payload.network, payload.disk_path, payload.cdrom, payload.disk_size_gb, payload.enable_guest_agent)
+    _mark_host_cache_stale(db, host)
     _record_event("vm.provision", f"vm {payload.name} created on host {payload.host_id}")
     _create_completed_task("vm.provision", payload.name, f"created cpu={payload.cpu_cores},mem={payload.memory_mb},image={payload.image},network={payload.network}")
     return {"host_id": payload.host_id, "vm": vm, "status": "created"}
@@ -513,14 +517,14 @@ def host_inventory_live(host_id: str, refresh: bool = False, include_snapshots: 
 
 
 @app.get("/api/v1/vms/{vm_id}/attachments")
-def vm_attachments(vm_id: str, host_id: str, db: Session = Depends(get_db)) -> dict:
+def vm_attachments(vm_id: str, host_id: str, refresh: bool = False, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, host_id)
     state = _host_cached_state(db, host)
     vm = next((item for item in state["vms"] if item.get("vm_id") == vm_id), None)
     if not vm:
         raise HTTPException(status_code=404, detail="vm not found")
 
-    snapshots = _libvirt_call(host, "snapshot_list", vm_id)
+    snapshots = _libvirt_call(host, "snapshot_list", vm_id) if refresh else []
     networks = state["networks"]
     images = state["images"]
 
@@ -529,7 +533,7 @@ def vm_attachments(vm_id: str, host_id: str, db: Session = Depends(get_db)) -> d
 
     override = VM_METADATA_OVERRIDES.get(host_id, {}).get(vm_id, {"labels": {}, "annotations": {}})
     volume_name = f"{vm.get('name', 'vm')}-{vm_id[:8]}.qcow2"
-    current_iso = _libvirt_call(host, "current_iso", vm_id)
+    current_iso = _libvirt_call(host, "current_iso", vm_id) if refresh else ""
     return {
         "host_id": host_id,
         "vm_id": vm_id,
@@ -550,19 +554,16 @@ def vm_action(vm_id: str, payload: VMHostActionRequest, db: Session = Depends(ge
     _enforce_policies(f"vm.action.{payload.action.value}", host_id=payload.host_id)
     host = _get_host_or_404(db, payload.host_id)
     _libvirt_call(host, "vm_action", vm_id, payload.action.value)
-    state = _refresh_host_cache(db, host)
-    vm = next((item for item in state["vms"] if item.get("vm_id") == vm_id), None)
-    if not vm:
-        raise HTTPException(status_code=404, detail="vm not found")
+    _mark_host_cache_stale(db, host)
     _record_event("vm.action", f"vm {vm_id} action={payload.action.value} on host {payload.host_id}")
-    return {"host_id": payload.host_id, "vm": vm}
+    return {"host_id": payload.host_id, "vm": {"vm_id": vm_id, "power_state": "changed", "cache": "stale"}}
 
 
 @app.delete("/api/v1/vms/{vm_id}")
 def delete_vm(vm_id: str, host_id: str, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, host_id)
     _libvirt_call(host, "delete_vm", vm_id)
-    _refresh_host_cache(db, host)
+    _mark_host_cache_stale(db, host)
     return {"host_id": host_id, "result": {"status": "deleted", "vm_id": vm_id}}
 
 
@@ -572,7 +573,7 @@ def create_network(payload: NetworkCreateRequest, request: Request, db: Session 
     _enforce_policies("network.create", host_id=payload.host_id)
     host = _get_host_or_404(db, payload.host_id)
     network = _libvirt_call(host, "create_network", payload.name, payload.cidr, payload.vlan_id)
-    _refresh_host_cache(db, host)
+    _mark_host_cache_stale(db, host)
     _record_event("network.create", f"network {payload.name} created on host {payload.host_id}")
     _create_completed_task("network.create", payload.name, f"cidr={payload.cidr},vlan={payload.vlan_id}")
     return {"host_id": payload.host_id, "network": network}
@@ -597,7 +598,7 @@ def delete_network(network_id: str, host_id: str, request: Request, db: Session 
     _require_roles(request, {"admin", "operator"})
     host = _get_host_or_404(db, host_id)
     _libvirt_call(host, "delete_network", network_id)
-    _refresh_host_cache(db, host)
+    _mark_host_cache_stale(db, host)
     _record_event("network.delete", f"network {network_id} deleted on {host_id}")
     return {"host_id": host_id, "result": {"status": "deleted", "network_id": network_id}}
 
@@ -606,12 +607,9 @@ def delete_network(network_id: str, host_id: str, request: Request, db: Session 
 def resize_vm(vm_id: str, payload: VMResizeRequest, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, payload.host_id)
     _libvirt_call(host, "resize", vm_id, payload.cpu_cores, payload.memory_mb)
-    state = _refresh_host_cache(db, host)
-    vm = next((item for item in state["vms"] if item.get("vm_id") == vm_id), None)
-    if not vm:
-        raise HTTPException(status_code=404, detail="vm not found")
+    _mark_host_cache_stale(db, host)
     _record_event("vm.resize", f"vm {vm_id} resized on host {payload.host_id}")
-    return {"host_id": payload.host_id, "vm": vm}
+    return {"host_id": payload.host_id, "vm": {"vm_id": vm_id, "cpu_cores": payload.cpu_cores, "memory_mb": payload.memory_mb, "cache": "stale"}}
 
 
 @app.post("/api/v1/vms/{vm_id}/clone")
@@ -636,7 +634,7 @@ def set_vm_metadata(vm_id: str, payload: VMMetadataRequest, db: Session = Depend
 def attach_recovery_iso(vm_id: str, payload: VMRecoveryISORequest, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, payload.host_id)
     result = _libvirt_call(host, "attach_iso", vm_id, payload.iso_path, payload.boot_once)
-    _refresh_host_cache(db, host)
+    _mark_host_cache_stale(db, host)
     _record_event("vm.recovery.iso.attach", f"recovery ISO attached for vm {vm_id} on host {payload.host_id}")
     _create_completed_task("vm.recovery.iso.attach", vm_id, f"iso={payload.iso_path}")
     return {"host_id": payload.host_id, "vm_id": vm_id, "status": "attached", "result": result}
@@ -646,7 +644,7 @@ def attach_recovery_iso(vm_id: str, payload: VMRecoveryISORequest, db: Session =
 def detach_recovery_iso(vm_id: str, payload: VMRecoveryISOReleaseRequest, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, payload.host_id)
     result = _libvirt_call(host, "detach_iso", vm_id)
-    _refresh_host_cache(db, host)
+    _mark_host_cache_stale(db, host)
     _record_event("vm.recovery.iso.detach", f"recovery ISO detached for vm {vm_id} on host {payload.host_id}")
     _create_completed_task("vm.recovery.iso.detach", vm_id, "recovery iso detached")
     return {"host_id": payload.host_id, "vm_id": vm_id, "status": "detached", "result": result}
@@ -664,7 +662,7 @@ def migrate_vm(vm_id: str, payload: VMMigrateRequest, db: Session = Depends(get_
 def create_snapshot(vm_id: str, payload: VMSnapshotCreateRequest, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, payload.host_id)
     snap = _libvirt_call(host, "snapshot_create", vm_id, payload.name)
-    _refresh_host_cache(db, host)
+    _mark_host_cache_stale(db, host)
     return {"host_id": payload.host_id, "snapshot": snap}
 
 
@@ -678,18 +676,15 @@ def list_snapshots(vm_id: str, host_id: str, db: Session = Depends(get_db)) -> d
 def revert_snapshot(vm_id: str, snapshot_id: str, payload: VMSnapshotHostRequest, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, payload.host_id)
     _libvirt_call(host, "snapshot_revert", vm_id, snapshot_id)
-    state = _refresh_host_cache(db, host)
-    vm = next((item for item in state["vms"] if item.get("vm_id") == vm_id), None)
-    if not vm:
-        raise HTTPException(status_code=404, detail="vm not found")
-    return {"host_id": payload.host_id, "vm": vm}
+    _mark_host_cache_stale(db, host)
+    return {"host_id": payload.host_id, "vm": {"vm_id": vm_id, "cache": "stale"}}
 
 
 @app.delete("/api/v1/vms/{vm_id}/snapshots/{snapshot_id}")
 def delete_snapshot(vm_id: str, snapshot_id: str, host_id: str, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, host_id)
     _libvirt_call(host, "snapshot_delete", vm_id, snapshot_id)
-    _refresh_host_cache(db, host)
+    _mark_host_cache_stale(db, host)
     return {"host_id": host_id, "result": {"status": "deleted", "snapshot_id": snapshot_id, "vm_id": vm_id}}
 
 
@@ -744,7 +739,7 @@ def create_image(payload: ImageCreateRequest, request: Request, db: Session = De
     _enforce_policies("image.create", host_id=payload.host_id)
     host = _get_host_or_404(db, payload.host_id)
     image = _libvirt_call(host, "create_image", payload.name, payload.source_url or "default", 20)
-    _refresh_host_cache(db, host)
+    _mark_host_cache_stale(db, host)
     _record_event("image.created", f"image {payload.name} created on host {payload.host_id}")
     _create_completed_task("image.create", payload.name, f"pool={payload.source_url or 'default'}")
     return {"host_id": payload.host_id, "image": image}
@@ -755,7 +750,7 @@ def delete_image(image_id: str, host_id: str, request: Request, db: Session = De
     _require_roles(request, {"admin", "operator"})
     host = _get_host_or_404(db, host_id)
     result = _libvirt_call(host, "delete_image", image_id)
-    _refresh_host_cache(db, host)
+    _mark_host_cache_stale(db, host)
     _record_event("image.deleted", f"image {image_id} deleted from host {host_id}")
     return {"host_id": host_id, "result": result}
 
@@ -1122,35 +1117,42 @@ def overview(db: Session = Depends(get_db)) -> dict:
 
 
 @app.get("/api/v1/vms/{vm_id}/console", response_model=ConsoleTicketResponse)
-def vm_console(vm_id: str, host_id: str, db: Session = Depends(get_db)) -> ConsoleTicketResponse:
+def vm_console(vm_id: str, host_id: str, refresh: bool = False, db: Session = Depends(get_db)) -> ConsoleTicketResponse:
     host = _get_host_or_404(db, host_id)
 
     now_ts = time.time()
-    for item in CONSOLE_SESSIONS:
-        if item.get("host_id") != host_id or item.get("vm_id") != vm_id:
-            continue
-        created = item.get("created_at", "")
-        try:
-            created_ts = datetime.fromisoformat(created.replace("Z", "+00:00")).timestamp()
-        except Exception:
-            created_ts = 0.0
-        if (now_ts - created_ts) <= CONSOLE_SESSION_TTL_S and item.get("novnc_url"):
-            return ConsoleTicketResponse(
-                host_id=host_id,
-                vm_id=vm_id,
-                ticket=item.get("ticket", ""),
-                noVNC_url=item.get("novnc_url", ""),
-            )
+    if not refresh:
+        for item in CONSOLE_SESSIONS:
+            if item.get("host_id") != host_id or item.get("vm_id") != vm_id:
+                continue
+            created = item.get("created_at", "")
+            try:
+                created_ts = datetime.fromisoformat(created.replace("Z", "+00:00")).timestamp()
+            except Exception:
+                created_ts = 0.0
+            if (now_ts - created_ts) <= CONSOLE_SESSION_TTL_S and item.get("novnc_url"):
+                return ConsoleTicketResponse(
+                    host_id=host_id,
+                    vm_id=vm_id,
+                    ticket=item.get("ticket", ""),
+                    noVNC_url=item.get("novnc_url", ""),
+                )
 
-    console = _libvirt_call(host, "console_info", vm_id)
-    ticket, novnc_url, console_meta = build_console_urls(
-        novnc_base_url=NOVNC_BASE_URL,
-        novnc_ws_base=NOVNC_WS_BASE,
-        host_id=host_id,
-        vm_id=vm_id,
-        host_address=host.address,
-        display_uri=str(console.get("display_uri") or ""),
-    )
+    try:
+        console = _libvirt_call(host, "console_info", vm_id)
+        ticket, novnc_url, console_meta = build_console_urls(
+            novnc_base_url=NOVNC_BASE_URL,
+            novnc_ws_base=NOVNC_WS_BASE,
+            host_id=host_id,
+            vm_id=vm_id,
+            host_address=host.address,
+            display_uri=str(console.get("display_uri") or ""),
+        )
+    except HTTPException as exc:
+        existing = next((item for item in CONSOLE_SESSIONS if item.get("host_id") == host_id and item.get("vm_id") == vm_id and item.get("novnc_url")), None)
+        if existing and not refresh:
+            return ConsoleTicketResponse(host_id=host_id, vm_id=vm_id, ticket=existing.get("ticket", ""), noVNC_url=existing.get("novnc_url", ""))
+        raise exc
 
     session = {
         "session_id": str(uuid4()),
@@ -1269,8 +1271,15 @@ def live_status(refresh: bool = False, db: Session = Depends(get_db)) -> dict:
     now_ts = datetime.now(timezone.utc).timestamp()
     cached = LIVE_STATUS_CACHE.get("payload")
     cached_at = float(LIVE_STATUS_CACHE.get("updated_at", 0.0) or 0.0)
-    if not refresh and cached and (now_ts - cached_at) <= LIVE_STATUS_TTL_S:
+    if cached and not refresh:
+        stale = (now_ts - cached_at) > LIVE_STATUS_TTL_S
+        if stale:
+            payload = dict(cached)
+            payload["cache"] = "stale"
+            return payload
         return cached
+    if not refresh and not cached:
+        return {"count": 0, "items": [], "timestamp": datetime.now(timezone.utc).isoformat(), "cache": "empty", "cache_ttl_s": LIVE_STATUS_TTL_S}
 
     hosts = db.query(Host).all()
     items: list[dict[str, Any]] = []
@@ -1293,7 +1302,7 @@ def live_status(refresh: bool = False, db: Session = Depends(get_db)) -> dict:
                 "libvirt_uri": host.libvirt_uri,
             }
         )
-    payload = {"count": len(items), "items": items, "timestamp": datetime.now(timezone.utc).isoformat(), "cache_ttl_s": LIVE_STATUS_TTL_S}
+    payload = {"count": len(items), "items": items, "timestamp": datetime.now(timezone.utc).isoformat(), "cache_ttl_s": LIVE_STATUS_TTL_S, "cache": "refresh"}
     LIVE_STATUS_CACHE["updated_at"] = now_ts
     LIVE_STATUS_CACHE["payload"] = payload
     return payload

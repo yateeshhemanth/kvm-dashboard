@@ -132,13 +132,42 @@ class LibvirtRemote:
         except LibvirtRemoteError:
             return ""
 
-    def create_vm(self, name: str, cpu_cores: int, memory_mb: int, image: str, network: str = "default") -> dict[str, Any]:
-        disk_path = self._disk_source_from_image(image)
+    def create_vm(
+        self,
+        name: str,
+        cpu_cores: int,
+        memory_mb: int,
+        image: str,
+        network: str = "default",
+        disk_path: str | None = None,
+        cdrom: str | None = None,
+        disk_size_gb: int | None = None,
+        enable_guest_agent: bool = True,
+    ) -> dict[str, Any]:
+        resolved_disk = (disk_path or "").strip() or self._disk_source_from_image(image)
         disk_xml = f"""<disk type='file' device='disk'>
       <driver name='qemu' type='qcow2'/>
-      <source file='{disk_path}'/>
+      <source file='{resolved_disk}'/>
       <target dev='vda' bus='virtio'/>
-    </disk>""" if disk_path else ""
+    </disk>""" if resolved_disk else ""
+
+        cdrom_xml = ""
+        boot_cdrom = ""
+        if cdrom:
+            cdrom_xml = f"""<disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='{cdrom}'/>
+      <target dev='hdb' bus='ide'/>
+      <readonly/>
+    </disk>"""
+            boot_cdrom = "<boot dev='cdrom'/>"
+
+        guest_agent_xml = ""
+        if enable_guest_agent:
+            guest_agent_xml = """<controller type='virtio-serial'/>
+    <channel type='unix'>
+      <target type='virtio' name='org.qemu.guest_agent.0'/>
+    </channel>"""
 
         domain_xml = f"""
 <domain type='kvm'>
@@ -149,6 +178,7 @@ class LibvirtRemote:
   <vcpu>{cpu_cores}</vcpu>
   <os>
     <type arch='x86_64' machine='pc'>hvm</type>
+    {boot_cdrom}
     <boot dev='hd'/>
     <boot dev='network'/>
   </os>
@@ -167,9 +197,11 @@ class LibvirtRemote:
       <model type='virtio'/>
     </interface>
     {disk_xml}
+    {cdrom_xml}
     <graphics type='vnc' autoport='yes' listen='0.0.0.0'/>
     <console type='pty'/>
     <serial type='pty'/>
+    {guest_agent_xml}
     <video>
       <model type='vga' vram='16384' heads='1'/>
     </video>
@@ -191,7 +223,9 @@ class LibvirtRemote:
             "power_state": "stopped",
             "networks": [network],
             "created_at": datetime.now(timezone.utc).isoformat(),
-            "disk_source": disk_path or None,
+            "disk_source": resolved_disk or None,
+            "cdrom": cdrom,
+            "disk_size_gb": disk_size_gb,
         }
 
     def console_info(self, vm_id: str) -> dict[str, Any]:
@@ -201,9 +235,19 @@ class LibvirtRemote:
         return {"display_uri": display_uri, "vnc_port": vnc_port}
 
     def resize(self, vm_id: str, cpu: int, mem_mb: int) -> None:
-        self._run(["setvcpus", vm_id, str(cpu), "--live", "--config"])
-        self._run(["setmaxmem", vm_id, str(mem_mb * 1024), "--config"])
-        self._run(["setmem", vm_id, str(mem_mb * 1024), "--live"])
+        mem_kib = str(mem_mb * 1024)
+        try:
+            self._run(["setvcpus", vm_id, str(cpu), "--live", "--config"])
+        except LibvirtRemoteError:
+            self._run(["setvcpus", vm_id, str(cpu), "--config"])
+        try:
+            self._run(["setmaxmem", vm_id, mem_kib, "--config"])
+        except LibvirtRemoteError:
+            pass
+        try:
+            self._run(["setmem", vm_id, mem_kib, "--live"])
+        except LibvirtRemoteError:
+            self._run(["setmem", vm_id, mem_kib, "--config"])
 
     def delete_vm(self, vm_id: str) -> None:
         try:

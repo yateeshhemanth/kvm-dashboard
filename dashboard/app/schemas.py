@@ -47,6 +47,10 @@ class VMProvisionRequest(BaseModel):
     memory_mb: int
     image: str
     network: str = "default"
+    disk_path: str | None = None
+    cdrom: str | None = None
+    disk_size_gb: int | None = None
+    enable_guest_agent: bool = True
 
 
 class VMHostActionRequest(BaseModel):

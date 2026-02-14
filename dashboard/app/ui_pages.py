@@ -105,7 +105,7 @@ def render_dashboard_page(
             <div class='page'>
             <div class='toolbar'>
               <div><h1 style='margin:0'>{config['title']}</h1><div class='muted'>{config['description']}</div></div>
-              <div class='row'><span id='realtimeStatus' class='muted'>Realtime refresh: initializing…</span><input id='search' class='search' placeholder='Filter table rows...' /></div>
+              <div class='row'><button class='btn' id='refreshNowBtn'>Refresh from libvirt</button><span id='realtimeStatus' class='muted'>Realtime refresh: initializing…</span><input id='search' class='search' placeholder='Filter table rows...' /></div>
             </div>
             <div class='cards'>
               <div class='card'><strong>Hosts</strong><div>{stats['hosts']}</div></div>
@@ -138,6 +138,14 @@ def render_dashboard_page(
           const actions = document.getElementById('actions');
           const searchInput = document.getElementById('search');
           let currentRows = [];
+          let manualRefreshRequested = false;
+
+          function withRefresh(path) {{
+            const useRefresh = manualRefreshRequested;
+            manualRefreshRequested = false;
+            if (!useRefresh) return path;
+            return path + (path.includes("?") ? "&" : "?") + "refresh=true";
+          }}
           let consoleLastUrl = '';
 
           window.showConsole = function showConsole(url, title='VM Console') {{
@@ -240,7 +248,7 @@ def render_dashboard_page(
           async function loadOverview() {{
             actions.innerHTML = `<strong>Quick links</strong><div class='row'><a class='btn' href='${{base||''}}/vms'>Go to VMs</a><a class='btn' href='${{base||''}}/storage'>Go to Storage</a><a class='btn' href='${{base||''}}/networks'>Go to Networks</a><a class='btn' href='${{base||''}}/console'>Go to Console</a></div>`;
             const ov = await api('/api/v1/overview');
-            const live = await api('/api/v1/live/status');
+            const live = await api(withRefresh('/api/v1/live/status'));
             const rows = [
               ['Hosts total', ov.hosts.total, 'Ready', ov.hosts.ready],
               ['CPU cores', ov.hosts.total_cpu_cores, 'Memory MB', ov.hosts.total_memory_mb],
@@ -264,6 +272,9 @@ def render_dashboard_page(
                     <input id='vmCpu' type='number' value='2' min='1' style='width:80px' />
                     <input id='vmMem' type='number' value='2048' min='512' style='width:100px' />
                     <input id='vmImage' placeholder='base.qcow2 or pool::volume' value='base.qcow2' />
+                    <input id='vmNet' placeholder='network' value='default' style='width:110px' />
+                    <input id='vmDiskPath' placeholder='/HUBDATASTORE0/images/.../disk.qcow2' style='min-width:290px' />
+                    <input id='vmCdrom' placeholder='/HUBDATASTORE0/iso/os.iso' style='min-width:220px' />
                     <button class='btn' id='createVmBtn'>Create VM</button>
                   </div>
                   <div class='row'>
@@ -312,7 +323,7 @@ def render_dashboard_page(
               content.innerHTML = "<div class='muted'>No hosts registered yet.</div>";
               return;
             }}
-            const live = await api(`/api/v1/hosts/${{hostId}}/inventory-live`);
+            const live = await api(withRefresh(`/api/v1/hosts/${{hostId}}/inventory-live`));
             const rows = (live.vms || []).map(vm => {{
               const att = (live.attachments || {{}})[vm.vm_id] || {{}};
               const snaps = (att.snapshots || []).length;
@@ -344,6 +355,9 @@ def render_dashboard_page(
                 cpu_cores: Number(document.getElementById('vmCpu').value),
                 memory_mb: Number(document.getElementById('vmMem').value),
                 image: document.getElementById('vmImage').value,
+                network: document.getElementById('vmNet').value || 'default',
+                disk_path: document.getElementById('vmDiskPath').value || null,
+                cdrom: document.getElementById('vmCdrom').value || null,
               }});
               loadVMs();
             }};
@@ -471,7 +485,7 @@ def render_dashboard_page(
 
           window.viewAttach = async (vmId, hostId) => {{
             try {{
-              const details = await api(`/api/v1/vms/${{vmId}}/attachments?host_id=${{encodeURIComponent(hostId)}}`);
+              const details = await api(withRefresh(`/api/v1/vms/${{vmId}}/attachments?host_id=${{encodeURIComponent(hostId)}}`));
               const att = details.attachments || {{}};
               const vm = details.vm || {{}};
               alert(`VM: ${{vmId}}
@@ -485,7 +499,7 @@ Recovery ISO: ${{vm.annotations?.['recovery.iso'] || 'not attached'}}`);
 
           window.openConsole = async (vmId, hostId) => {{
             try {{
-              const c = await api(`/api/v1/vms/${{vmId}}/console?host_id=${{encodeURIComponent(hostId)}}`);
+              const c = await api(withRefresh(`/api/v1/vms/${{vmId}}/console?host_id=${{encodeURIComponent(hostId)}}`));
               showConsole(c.noVNC_url, `Console · ${{vmId}}@${{hostId}}`);
             }} catch (e) {{ setError(e); }}
           }};
@@ -494,7 +508,7 @@ Recovery ISO: ${{vm.annotations?.['recovery.iso'] || 'not attached'}}`);
             const {{ hosts, hostId }} = await pickSelectedHostId();
             actions.innerHTML = `<strong>Storage actions</strong><div class='row'>${{renderHostSelector(hosts, hostId, 'storageHostSelect')}}</div><div class='muted'>Storage pools include qcow2 images and VM disks.</div>`;
             if (!hostId) {{ content.innerHTML = "<div class='muted'>No hosts registered yet.</div>"; return; }}
-            const data = await api(`/api/v1/hosts/${{hostId}}/storage-pools`);
+            const data = await api(withRefresh(`/api/v1/hosts/${{hostId}}/storage-pools`));
             const rows = [];
             (data.storage_pools || []).forEach(pool => {{
               rows.push([pool.name, pool.type, pool.state, pool.capacity_gb, pool.allocated_gb, pool.available_gb]);
@@ -509,7 +523,7 @@ Recovery ISO: ${{vm.annotations?.['recovery.iso'] || 'not attached'}}`);
             const {{ hosts, hostId }} = await pickSelectedHostId();
             actions.innerHTML = `<strong>Network actions</strong><div class='row'>${{renderHostSelector(hosts, hostId, 'networkHostSelect')}}</div><div class='row'><input id='netName' placeholder='network name' /><input id='netCidr' placeholder='10.10.0.0/24' /><input id='netVlan' type='number' placeholder='vlan' style='width:90px' /><button class='btn' id='createNetBtn'>Create network</button></div><div class='row'><select id='advSection'><option value='vlan_trunks'>VLAN trunking</option><option value='bridge_automation'>Bridge automation</option><option value='ipam'>IPAM</option><option value='security_policies'>Security policy</option></select><input id='advName' placeholder='name/description' /><button class='btn' id='addAdvNetBtn'>Add advanced policy</button></div>`;
             if (!hostId) {{ content.innerHTML = "<div class='muted'>No hosts registered yet.</div>"; return; }}
-            const data = await api(`/api/v1/hosts/${{hostId}}/networks`);
+            const data = await api(withRefresh(`/api/v1/hosts/${{hostId}}/networks`));
             const adv = await api('/api/v1/networks/advanced');
             const rows = (data.networks || []).map(n => [n.name, n.cidr, n.vlan_id ?? '-', (n.attached_vm_ids || []).join(', ') || '-']);
             (adv.vlan_trunks || []).forEach(item => rows.push([`ADV::${{item.name || item.id}}`, 'trunk', item.id, '-']));
@@ -535,7 +549,7 @@ Recovery ISO: ${{vm.annotations?.['recovery.iso'] || 'not attached'}}`);
             const {{ hosts, hostId }} = await pickSelectedHostId();
             actions.innerHTML = `<strong>Image actions</strong><div class='row'>${{renderHostSelector(hosts, hostId, 'imageHostSelect')}}</div><div class='row'><input id='imgName' placeholder='image name' /><input id='imgSrc' placeholder='https://.../image.qcow2' style='min-width:280px'/><button class='btn' id='createImgBtn'>Create image</button><button class='btn' id='importImgBtn'>Import image pipeline</button></div><div class='row'><input id='depImgId' placeholder='image id' /><input id='depVmName' placeholder='target vm name' /><button class='btn' id='deployImgBtn'>Deploy image</button></div>`;
             if (!hostId) {{ content.innerHTML = "<div class='muted'>No hosts registered yet.</div>"; return; }}
-            const data = await api(`/api/v1/hosts/${{hostId}}/images`);
+            const data = await api(withRefresh(`/api/v1/hosts/${{hostId}}/images`));
             const deployments = await api('/api/v1/images/deployments');
             const rows = (data.images || []).map(i => [i.image_id || '-', i.name, i.status, i.source_url, i.created_at]);
             (deployments.items || []).forEach(d => rows.push([d.image_id, `DEPLOY::${{d.vm_name}}`, d.status, d.host_id, d.created_at]));
@@ -559,7 +573,7 @@ Recovery ISO: ${{vm.annotations?.['recovery.iso'] || 'not attached'}}`);
           async function loadConsole() {{
             const {{ hosts, hostId }} = await pickSelectedHostId();
             actions.innerHTML = `<strong>Console options</strong><div class='row'>${{renderHostSelector(hosts, hostId, 'consoleHostSelect')}}</div><div class='muted'>Use the VMs page “Console” action or request here manually.</div><div class='row'><input id='conVm' placeholder='vm id'/><button class='btn' id='conBtn'>Create console ticket</button></div>`;
-            const sess = await api('/api/v1/console/sessions');
+            const sess = await api(withRefresh('/api/v1/console/sessions'));
             const novnc = await api('/api/v1/console/novnc/status');
             const rows = (sess.items || []).map(s => [
               s.session_id,
@@ -573,7 +587,7 @@ Recovery ISO: ${{vm.annotations?.['recovery.iso'] || 'not attached'}}`);
             document.getElementById('conBtn').onclick = async () => {{
               if (!hostId) return;
               const vmId = document.getElementById('conVm').value;
-              const t = await api(`/api/v1/vms/${{vmId}}/console?host_id=${{encodeURIComponent(hostId)}}`);
+              const t = await api(withRefresh(`/api/v1/vms/${{vmId}}/console?host_id=${{encodeURIComponent(hostId)}}`));
               showConsole(t.noVNC_url, `Console · ${{vmId}}@${{hostId}}`);
             }};
             bindSearch();
@@ -678,7 +692,7 @@ Recovery ISO: ${{vm.annotations?.['recovery.iso'] || 'not attached'}}`);
           }};
 
           let refreshTimer = null;
-          const realtimePages = new Set(['dashboard','vms','storage','networks','images','console','events','tasks']);
+          const realtimePages = new Set(['events','tasks']);
 
           function updateRealtimeStatus(msg) {{
             const el = document.getElementById('realtimeStatus');
@@ -704,7 +718,7 @@ Recovery ISO: ${{vm.annotations?.['recovery.iso'] || 'not attached'}}`);
 
           function startAutoRefresh() {{
             if (!realtimePages.has(key)) {{
-              updateRealtimeStatus('Realtime refresh: not required on this page');
+              updateRealtimeStatus('Auto refresh disabled on this page. Use Refresh from libvirt when needed.');
               return;
             }}
             if (refreshTimer) clearInterval(refreshTimer);
@@ -726,6 +740,8 @@ Recovery ISO: ${{vm.annotations?.['recovery.iso'] || 'not attached'}}`);
             if (closeBtn) closeBtn.onclick = closeConsole;
             if (modal) modal.onclick = (e) => {{ if (e.target === modal) closeConsole(); }};
             if (popBtn) popBtn.onclick = () => {{ if (consoleLastUrl) window.open(consoleLastUrl, '_blank'); }};
+            const refreshBtn = document.getElementById('refreshNowBtn');
+            if (refreshBtn) refreshBtn.onclick = async () => {{ manualRefreshRequested = true; await refreshPage(); }};
             try {{
               await refreshPage();
               startAutoRefresh();
