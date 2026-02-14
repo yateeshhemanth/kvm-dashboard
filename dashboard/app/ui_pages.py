@@ -138,7 +138,7 @@ def render_dashboard_page(
           let currentRows = [];
           let consoleLastUrl = '';
 
-          function showConsole(url, title='VM Console') {{
+          window.showConsole = function showConsole(url, title='VM Console') {{
             const modal = document.getElementById('consoleModal');
             const frame = document.getElementById('consoleFrame');
             const titleEl = document.getElementById('consoleTitle');
@@ -540,9 +540,15 @@ Recovery ISO: ${{vm.annotations?.['recovery.iso'] || 'not attached'}}`);
             actions.innerHTML = `<strong>Console options</strong><div class='row'>${{renderHostSelector(hosts, hostId, 'consoleHostSelect')}}</div><div class='muted'>Use the VMs page “Console” action or request here manually.</div><div class='row'><input id='conVm' placeholder='vm id'/><button class='btn' id='conBtn'>Create console ticket</button></div>`;
             const sess = await api('/api/v1/console/sessions');
             const novnc = await api('/api/v1/console/novnc/status');
-            const rows = (sess.items || []).map(s => [s.session_id, s.host_id, s.vm_id, s.created_at]);
-            rows.unshift(['noVNC base', '-', novnc.novnc_base_url, `ws:${{novnc.novnc_ws_base}}`]);
-            content.innerHTML = `<strong>Console sessions + noVNC status</strong>${{table(['Session','Host','VM','Created/Path'], rows)}}`;
+            const rows = (sess.items || []).map(s => [
+              s.session_id,
+              s.host_id,
+              s.vm_id,
+              s.created_at,
+              `<button class='btn' onclick="showConsole('${{(s.novnc_url || '').replace(/'/g, "\\'")}}','Console · ${{s.vm_id}}@${{s.host_id}}')">Open</button>`
+            ]);
+            rows.unshift(['noVNC base', '-', novnc.novnc_base_url, `ws:${{novnc.novnc_ws_base}}`, '-']);
+            content.innerHTML = `<strong>Console sessions + noVNC status</strong>${{table(['Session','Host','VM','Created/Path','Action'], rows)}}`;
             document.getElementById('conBtn').onclick = async () => {{
               if (!hostId) return;
               const vmId = document.getElementById('conVm').value;

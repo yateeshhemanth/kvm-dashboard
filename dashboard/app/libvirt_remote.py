@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import tempfile
@@ -160,8 +161,68 @@ class LibvirtRemote:
         nets = [n.strip() for n in self._run(["net-list", "--all", "--name"]).splitlines() if n.strip()]
         return [{"network_id": n, "name": n, "cidr": "n/a", "vlan_id": None, "attached_vm_ids": []} for n in nets]
 
+    def _volume_usage_map(self) -> dict[str, set[str]]:
+        usage: dict[str, set[str]] = {}
+        vm_names = [n.strip() for n in self._run(["list", "--all", "--name"]).splitlines() if n.strip()]
+        for vm_name in vm_names:
+            try:
+                bout = self._run(["domblklist", vm_name, "--details"])
+            except LibvirtRemoteError:
+                continue
+            for line in bout.splitlines()[2:]:
+                parts = line.split()
+                if len(parts) < 4:
+                    continue
+                source = parts[-1]
+                base = os.path.basename(source)
+                if not base or source == "-":
+                    continue
+                usage.setdefault(base, set()).add(vm_name)
+        return usage
+
+    def current_iso(self, vm_id: str) -> str:
+        try:
+            bout = self._run(["domblklist", vm_id, "--details"])
+        except LibvirtRemoteError:
+            return ""
+        for line in bout.splitlines()[2:]:
+            parts = line.split()
+            if len(parts) >= 4 and parts[0] == "cdrom" and parts[-1] != "-":
+                return parts[-1]
+        return ""
+
+    def attach_iso(self, vm_id: str, iso_path: str, boot_once: bool = True) -> dict[str, Any]:
+        attempts = [
+            ["change-media", vm_id, "hdb", "--insert", iso_path, "--live", "--config"],
+            ["attach-disk", vm_id, iso_path, "hdb", "--type", "cdrom", "--mode", "readonly", "--live", "--config"],
+        ]
+        last_error = None
+        for cmd in attempts:
+            try:
+                self._run(cmd)
+                break
+            except LibvirtRemoteError as exc:
+                last_error = exc
+        else:
+            raise LibvirtRemoteError(f"failed to attach iso: {last_error}")
+        return {"vm_id": vm_id, "iso_path": iso_path, "boot_once": boot_once, "attached": True}
+
+    def detach_iso(self, vm_id: str) -> dict[str, Any]:
+        attempts = [
+            ["change-media", vm_id, "hdb", "--eject", "--live", "--config"],
+            ["detach-disk", vm_id, "hdb", "--live", "--config"],
+        ]
+        for cmd in attempts:
+            try:
+                self._run(cmd)
+                return {"vm_id": vm_id, "detached": True}
+            except LibvirtRemoteError:
+                continue
+        return {"vm_id": vm_id, "detached": False}
+
     def list_storage_pools(self) -> list[dict[str, Any]]:
         pools = [n.strip() for n in self._run(["pool-list", "--all", "--name"]).splitlines() if n.strip()]
+        usage = self._volume_usage_map()
         out: list[dict[str, Any]] = []
         for p in pools:
             vols: list[dict[str, Any]] = []
@@ -169,8 +230,27 @@ class LibvirtRemote:
                 vout = self._run(["vol-list", p])
                 for line in vout.splitlines()[2:]:
                     parts = line.split()
-                    if parts:
-                        vols.append({"name": parts[0], "kind": "qcow2", "used_by": "-", "size_gb": 0})
+                    if not parts:
+                        continue
+                    vol_name = parts[0]
+                    used_by = sorted(usage.get(vol_name, set()))
+                    size_gb = 0.0
+                    try:
+                        info = self._run(["vol-info", vol_name, "--pool", p])
+                        m = re.search(r"Capacity:\s+([\d.]+)\s+([A-Za-z]+)", info)
+                        if m:
+                            size = float(m.group(1))
+                            unit = m.group(2).lower()
+                            if unit.startswith("g"):
+                                size_gb = size
+                            elif unit.startswith("m"):
+                                size_gb = size / 1024.0
+                            elif unit.startswith("k"):
+                                size_gb = size / (1024.0 * 1024.0)
+                    except LibvirtRemoteError:
+                        pass
+                    kind = "iso" if vol_name.lower().endswith('.iso') else ("qcow2" if vol_name.lower().endswith('.qcow2') else "disk")
+                    vols.append({"name": vol_name, "kind": kind, "used_by": ",".join(used_by) if used_by else "-", "size_gb": round(size_gb, 2)})
             except LibvirtRemoteError:
                 pass
             out.append({"pool_id": p, "name": p, "type": "dir", "state": "active", "capacity_gb": 0, "allocated_gb": 0, "available_gb": 0, "volumes": vols})
@@ -181,7 +261,7 @@ class LibvirtRemote:
         for pool in self.list_storage_pools():
             for vol in pool.get("volumes", []):
                 if vol["name"].endswith((".qcow2", ".iso", ".img")):
-                    images.append({"image_id": f"{pool['name']}::{vol['name']}", "name": vol["name"], "source_url": pool["name"], "status": "available", "created_at": datetime.now(timezone.utc).isoformat()})
+                    images.append({"image_id": f"{pool['name']}::{vol['name']}", "name": vol["name"], "source_url": pool["name"], "status": "available", "used_by": vol.get("used_by", "-"), "created_at": datetime.now(timezone.utc).isoformat()})
         return images
 
 

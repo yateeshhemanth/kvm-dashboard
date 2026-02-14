@@ -1,14 +1,11 @@
 from datetime import datetime, timezone
-import json
 import os
-import time
 from typing import Any
 from uuid import uuid4
 from urllib.parse import urlencode
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from .db import get_db, init_db
@@ -49,10 +46,13 @@ from .schemas_day2 import VMOperationTaskRequest, VMRecoveryISOReleaseRequest, V
 from .day2_services import SUPPORTED_VM_TASK_TYPES, normalize_task_type
 from .ui_pages import render_dashboard_page
 from .libvirt_remote import LibvirtRemote, LibvirtRemoteError
+from .libvirt_cache import LibvirtCacheStore
+from .vmware_compat import build_vmware_router
+from .auth import login_get, login_post, logout_post, require_ui_auth
 
 app = FastAPI(title="KVM Dashboard API", version="0.7.1")
 
-LIBVIRT_CACHE_TTL_S = int(os.getenv("LIBVIRT_CACHE_TTL_S", "15"))
+LIBVIRT_CACHE_TTL_S = int(os.getenv("LIBVIRT_CACHE_TTL_S", "60"))
 NOVNC_BASE_URL = os.getenv("NOVNC_BASE_URL", "/console/noVNC/viewer")
 NOVNC_WS_BASE = os.getenv("NOVNC_WS_BASE", "/console/noVNC/websockify")
 BASE_PATH = os.getenv("DASHBOARD_BASE_PATH", "").strip()
@@ -117,6 +117,8 @@ PENDING_TASKS: list[dict[str, str]] = [
     {"id": "PEND-006", "area": "Images", "task": "Add image versioning, checksum, and storage location metadata", "priority": "medium"},
     {"id": "PEND-007", "area": "Platform", "task": "Add metrics endpoint and Prometheus export", "priority": "medium"},
 ]
+
+CACHE_STORE = LibvirtCacheStore(ttl_s=LIBVIRT_CACHE_TTL_S)
 
 
 def _with_base(path: str) -> str:
@@ -242,6 +244,22 @@ def healthz() -> dict[str, str]:
     return {"status": "ok", "base_path": BASE_PATH or "/"}
 
 
+
+
+@app.get("/login", response_class=HTMLResponse)
+def dashboard_login_page(db: Session = Depends(get_db)) -> HTMLResponse:
+    return login_get(db)
+
+
+@app.post("/login")
+def dashboard_login_submit(username: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)):
+    return login_post(username=username, password=password, db=db)
+
+
+@app.post("/logout")
+def dashboard_logout(request: Request, db: Session = Depends(get_db)):
+    return logout_post(request=request, db=db)
+
 def _apply_host_action(host: Host, action: HostAction) -> None:
     if action == HostAction.mark_ready:
         host.status = "ready"
@@ -272,96 +290,13 @@ def _libvirt_call(host: Host, fn_name: str, *args):
 
 
 
-def _ensure_libvirt_cache_table(db: Session) -> None:
-    db.execute(text("""
-        CREATE TABLE IF NOT EXISTS host_libvirt_cache (
-            host_id VARCHAR(128) PRIMARY KEY,
-            vms_json TEXT NOT NULL,
-            networks_json TEXT NOT NULL,
-            images_json TEXT NOT NULL,
-            pools_json TEXT NOT NULL,
-            updated_at DOUBLE PRECISION NOT NULL,
-            last_error TEXT,
-            last_success_at DOUBLE PRECISION
-        )
-    """))
-    db.execute(text("ALTER TABLE host_libvirt_cache ADD COLUMN IF NOT EXISTS last_error TEXT"))
-    db.execute(text("ALTER TABLE host_libvirt_cache ADD COLUMN IF NOT EXISTS last_success_at DOUBLE PRECISION"))
-    db.commit()
-
-
 def _refresh_host_cache(db: Session, host: Host) -> dict[str, Any]:
-    vms = _libvirt_call(host, "list_vms")
-    networks = _libvirt_call(host, "list_networks")
-    images = _libvirt_call(host, "list_images")
-    pools = _libvirt_call(host, "list_storage_pools")
-    now = time.time()
-    _ensure_libvirt_cache_table(db)
-    db.execute(
-        text("""
-            INSERT INTO host_libvirt_cache(host_id, vms_json, networks_json, images_json, pools_json, updated_at, last_error, last_success_at)
-            VALUES (:host_id, :vms_json, :networks_json, :images_json, :pools_json, :updated_at, NULL, :updated_at)
-            ON CONFLICT(host_id) DO UPDATE SET
-              vms_json=excluded.vms_json,
-              networks_json=excluded.networks_json,
-              images_json=excluded.images_json,
-              pools_json=excluded.pools_json,
-              updated_at=excluded.updated_at,
-              last_error=NULL,
-              last_success_at=excluded.updated_at
-        """),
-        {
-            "host_id": host.host_id,
-            "vms_json": json.dumps(vms),
-            "networks_json": json.dumps(networks),
-            "images_json": json.dumps(images),
-            "pools_json": json.dumps(pools),
-            "updated_at": now,
-        },
-    )
-    db.commit()
-    return {"vms": vms, "networks": networks, "images": images, "pools": pools, "updated_at": now, "cache": "miss"}
+    return CACHE_STORE.refresh(db, host, _libvirt_call)
 
 
 def _host_cached_state(db: Session, host: Host, *, force_refresh: bool = False) -> dict[str, Any]:
-    _ensure_libvirt_cache_table(db)
-    row = db.execute(
-        text("SELECT vms_json, networks_json, images_json, pools_json, updated_at, last_error, last_success_at FROM host_libvirt_cache WHERE host_id=:host_id"),
-        {"host_id": host.host_id},
-    ).first()
+    return CACHE_STORE.get(db, host, _libvirt_call, force_refresh=force_refresh)
 
-    if not force_refresh and row and (time.time() - float(row.updated_at) <= LIBVIRT_CACHE_TTL_S):
-        return {
-            "vms": json.loads(row.vms_json),
-            "networks": json.loads(row.networks_json),
-            "images": json.loads(row.images_json),
-            "pools": json.loads(row.pools_json),
-            "updated_at": float(row.updated_at),
-            "last_error": row.last_error,
-            "last_success_at": float(row.last_success_at) if row.last_success_at else None,
-            "cache": "hit",
-        }
-
-    try:
-        return _refresh_host_cache(db, host)
-    except HTTPException as exc:
-        if row:
-            db.execute(
-                text("UPDATE host_libvirt_cache SET last_error=:last_error WHERE host_id=:host_id"),
-                {"host_id": host.host_id, "last_error": str(exc.detail)},
-            )
-            db.commit()
-            return {
-                "vms": json.loads(row.vms_json),
-                "networks": json.loads(row.networks_json),
-                "images": json.loads(row.images_json),
-                "pools": json.loads(row.pools_json),
-                "updated_at": float(row.updated_at),
-                "last_error": str(exc.detail),
-                "last_success_at": float(row.last_success_at) if row.last_success_at else None,
-                "cache": "stale",
-            }
-        raise
 
 def _get_host_or_404(db: Session, host_id: str) -> Host:
     host = db.query(Host).filter(Host.host_id == host_id).first()
@@ -388,7 +323,7 @@ def _render_ui_page(page: str, db: Session) -> str:
 @app.get("/ui/", response_class=HTMLResponse)
 @app.get("/index.html", response_class=HTMLResponse)
 @app.get("/home", response_class=HTMLResponse)
-def dashboard_home(db: Session = Depends(get_db)) -> str:
+def dashboard_home(_user=Depends(require_ui_auth), db: Session = Depends(get_db)) -> str:
     return _render_ui_page("dashboard", db)
 
 
@@ -401,7 +336,7 @@ def dashboard_home(db: Session = Depends(get_db)) -> str:
 @app.get("/policies", response_class=HTMLResponse)
 @app.get("/events", response_class=HTMLResponse)
 @app.get("/tasks", response_class=HTMLResponse)
-def dashboard_sections(request: Request, db: Session = Depends(get_db)) -> str:
+def dashboard_sections(request: Request, _user=Depends(require_ui_auth), db: Session = Depends(get_db)) -> str:
     page = request.url.path.strip("/").split("/")[0] or "dashboard"
     return _render_ui_page(page, db)
 
@@ -508,17 +443,18 @@ def list_host_vms(host_id: str, refresh: bool = False, db: Session = Depends(get
 
 
 @app.get("/api/v1/hosts/{host_id}/inventory-live")
-def host_inventory_live(host_id: str, refresh: bool = False, db: Session = Depends(get_db)) -> dict:
+def host_inventory_live(host_id: str, refresh: bool = False, include_snapshots: bool = False, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, host_id)
     state = _host_cached_state(db, host, force_refresh=refresh)
     vms, networks, images = state["vms"], state["networks"], state["images"]
     vm_snapshots: dict[str, Any] = {}
-    for vm in vms:
-        vm_id = vm.get("vm_id")
-        if vm_id:
-            vm_snapshots[vm_id] = _libvirt_call(host, "snapshot_list", vm_id)
+    if include_snapshots:
+        for vm in vms:
+            vm_id = vm.get("vm_id")
+            if vm_id:
+                vm_snapshots[vm_id] = _libvirt_call(host, "snapshot_list", vm_id)
     attachments = {vm.get("vm_id"): {"networks": vm.get("networks", []), "image": {"name": vm.get("image")}, "snapshots": vm_snapshots.get(vm.get("vm_id"), [])} for vm in vms if vm.get("vm_id")}
-    return {"host_id": host_id, "cache": state["cache"], "cached_at": state["updated_at"], "state": {"vm_count": len(vms), "network_count": len(networks), "image_count": len(images), "snapshot_count": sum(len(items) for items in vm_snapshots.values())}, "vms": vms, "networks": networks, "images": images, "attachments": attachments}
+    return {"host_id": host_id, "cache": state["cache"], "cached_at": state["updated_at"], "last_error": state.get("last_error"), "last_success_at": state.get("last_success_at"), "state": {"vm_count": len(vms), "network_count": len(networks), "image_count": len(images), "snapshot_count": sum(len(items) for items in vm_snapshots.values())}, "vms": vms, "networks": networks, "images": images, "attachments": attachments}
 
 
 @app.get("/api/v1/vms/{vm_id}/attachments")
@@ -538,6 +474,7 @@ def vm_attachments(vm_id: str, host_id: str, db: Session = Depends(get_db)) -> d
 
     override = VM_METADATA_OVERRIDES.get(host_id, {}).get(vm_id, {"labels": {}, "annotations": {}})
     volume_name = f"{vm.get('name', 'vm')}-{vm_id[:8]}.qcow2"
+    current_iso = _libvirt_call(host, "current_iso", vm_id)
     return {
         "host_id": host_id,
         "vm_id": vm_id,
@@ -548,6 +485,7 @@ def vm_attachments(vm_id: str, host_id: str, db: Session = Depends(get_db)) -> d
             "networks": attached_networks,
             "snapshots": snapshots,
             "volumes": [{"name": volume_name, "format": "qcow2", "size_gb": 20}],
+            "recovery_iso": current_iso or None,
         },
     }
 
@@ -641,28 +579,22 @@ def set_vm_metadata(vm_id: str, payload: VMMetadataRequest, db: Session = Depend
 
 @app.post("/api/v1/vms/{vm_id}/recovery/attach-iso")
 def attach_recovery_iso(vm_id: str, payload: VMRecoveryISORequest, db: Session = Depends(get_db)) -> dict:
-    _get_host_or_404(db, payload.host_id)
-    override = VM_METADATA_OVERRIDES.setdefault(payload.host_id, {}).setdefault(vm_id, {"labels": {}, "annotations": {}})
-    override.setdefault("labels", {})["recovery_mode"] = "enabled"
-    override.setdefault("annotations", {})["recovery.iso"] = payload.iso_path
-    override.setdefault("annotations", {})["recovery.boot_once"] = str(payload.boot_once).lower()
-    override.setdefault("annotations", {})["recovery.attached_at"] = datetime.now(timezone.utc).isoformat()
+    host = _get_host_or_404(db, payload.host_id)
+    result = _libvirt_call(host, "attach_iso", vm_id, payload.iso_path, payload.boot_once)
+    _refresh_host_cache(db, host)
     _record_event("vm.recovery.iso.attach", f"recovery ISO attached for vm {vm_id} on host {payload.host_id}")
     _create_completed_task("vm.recovery.iso.attach", vm_id, f"iso={payload.iso_path}")
-    return {"host_id": payload.host_id, "vm_id": vm_id, "status": "attached", "vm": {"vm_id": vm_id, **override}}
+    return {"host_id": payload.host_id, "vm_id": vm_id, "status": "attached", "result": result}
 
 
 @app.post("/api/v1/vms/{vm_id}/recovery/detach-iso")
 def detach_recovery_iso(vm_id: str, payload: VMRecoveryISOReleaseRequest, db: Session = Depends(get_db)) -> dict:
-    _get_host_or_404(db, payload.host_id)
-    override = VM_METADATA_OVERRIDES.setdefault(payload.host_id, {}).setdefault(vm_id, {"labels": {}, "annotations": {}})
-    override.setdefault("labels", {})["recovery_mode"] = "disabled"
-    override.setdefault("annotations", {})["recovery.iso"] = ""
-    override.setdefault("annotations", {})["recovery.boot_once"] = "false"
-    override.setdefault("annotations", {})["recovery.detached_at"] = datetime.now(timezone.utc).isoformat()
+    host = _get_host_or_404(db, payload.host_id)
+    result = _libvirt_call(host, "detach_iso", vm_id)
+    _refresh_host_cache(db, host)
     _record_event("vm.recovery.iso.detach", f"recovery ISO detached for vm {vm_id} on host {payload.host_id}")
     _create_completed_task("vm.recovery.iso.detach", vm_id, "recovery iso detached")
-    return {"host_id": payload.host_id, "vm_id": vm_id, "status": "detached", "vm": {"vm_id": vm_id, **override}}
+    return {"host_id": payload.host_id, "vm_id": vm_id, "status": "detached", "result": result}
 
 @app.post("/api/v1/vms/{vm_id}/migrate")
 def migrate_vm(vm_id: str, payload: VMMigrateRequest, db: Session = Depends(get_db)) -> dict:
@@ -958,6 +890,9 @@ def create_runbook_schedule(runbook_name: str, cron: str, host_id: str | None = 
     RUNBOOK_SCHEDULES[schedule["schedule_id"]] = schedule
     return schedule
 
+
+
+app.include_router(build_vmware_router(_get_host_or_404, _libvirt_call, _refresh_host_cache))
 
 @app.get("/api/v1/routes")
 def list_routes() -> dict:
@@ -1358,10 +1293,14 @@ def list_image_deployments(limit: int = 50) -> dict:
 
 
 @app.get("/{path:path}", include_in_schema=False, response_class=HTMLResponse)
-def dashboard_fallback(path: str, db: Session = Depends(get_db)) -> HTMLResponse:
+def dashboard_fallback(path: str, request: Request, db: Session = Depends(get_db)) -> HTMLResponse:
     if _is_api_or_reserved_path(path):
         raise HTTPException(status_code=404, detail="page not found")
-    return HTMLResponse(dashboard_home(db))
+    try:
+        require_ui_auth(request, db)
+    except HTTPException:
+        return RedirectResponse(url="/login", status_code=303)
+    return HTMLResponse(_render_ui_page("dashboard", db))
 
 
 @app.exception_handler(404)
@@ -1372,6 +1311,10 @@ def not_found_handler(request: Request, exc: HTTPException):
         db_gen = get_db()
         try:
             db = next(db_gen)
+            try:
+                require_ui_auth(request, db)
+            except HTTPException:
+                return RedirectResponse(url="/login", status_code=303)
             return HTMLResponse(_render_ui_page("dashboard", db), status_code=200)
         except Exception:
             pass
