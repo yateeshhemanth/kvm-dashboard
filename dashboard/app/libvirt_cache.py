@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from typing import Any, Callable
 
@@ -14,23 +15,36 @@ from .models import Host
 class LibvirtCacheStore:
     def __init__(self, ttl_s: int) -> None:
         self.ttl_s = ttl_s
+        self._schema_checked = False
+        self._schema_lock = threading.Lock()
 
     def ensure_table(self, db: Session) -> None:
-        db.execute(text("""
-            CREATE TABLE IF NOT EXISTS host_libvirt_cache (
-                host_id VARCHAR(128) PRIMARY KEY,
-                vms_json TEXT NOT NULL,
-                networks_json TEXT NOT NULL,
-                images_json TEXT NOT NULL,
-                pools_json TEXT NOT NULL,
-                updated_at DOUBLE PRECISION NOT NULL,
-                last_error TEXT,
-                last_success_at DOUBLE PRECISION
-            )
-        """))
-        db.execute(text("ALTER TABLE host_libvirt_cache ADD COLUMN IF NOT EXISTS last_error TEXT"))
-        db.execute(text("ALTER TABLE host_libvirt_cache ADD COLUMN IF NOT EXISTS last_success_at DOUBLE PRECISION"))
-        db.commit()
+        if self._schema_checked:
+            return
+        with self._schema_lock:
+            if self._schema_checked:
+                return
+            db.execute(text("""
+                CREATE TABLE IF NOT EXISTS host_libvirt_cache (
+                    host_id VARCHAR(128) PRIMARY KEY,
+                    vms_json TEXT NOT NULL,
+                    networks_json TEXT NOT NULL,
+                    images_json TEXT NOT NULL,
+                    pools_json TEXT NOT NULL,
+                    updated_at DOUBLE PRECISION NOT NULL,
+                    last_error TEXT,
+                    last_success_at DOUBLE PRECISION
+                )
+            """))
+            # Serialize schema changes across multi-worker deployments.
+            db.execute(text("SELECT pg_advisory_lock(8456001)"))
+            try:
+                db.execute(text("ALTER TABLE host_libvirt_cache ADD COLUMN IF NOT EXISTS last_error TEXT"))
+                db.execute(text("ALTER TABLE host_libvirt_cache ADD COLUMN IF NOT EXISTS last_success_at DOUBLE PRECISION"))
+            finally:
+                db.execute(text("SELECT pg_advisory_unlock(8456001)"))
+            db.commit()
+            self._schema_checked = True
 
     def refresh(self, db: Session, host: Host, fetcher: Callable[[Host, str], Any]) -> dict[str, Any]:
         vms = fetcher(host, "list_vms")
@@ -102,4 +116,13 @@ class LibvirtCacheStore:
                     "last_success_at": float(row.last_success_at) if row.last_success_at else None,
                     "cache": "stale",
                 }
-            raise
+            return {
+                "vms": [],
+                "networks": [],
+                "images": [],
+                "pools": [],
+                "updated_at": time.time(),
+                "last_error": str(exc.detail),
+                "last_success_at": None,
+                "cache": "error",
+            }

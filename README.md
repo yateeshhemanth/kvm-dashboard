@@ -94,6 +94,19 @@ curl http://localhost:9090/agent/status
 
 Visit: `http://localhost:8000/`
 
+
+### 3.1) Login credentials (Dashboard UI)
+
+Dashboard UI now uses DB-backed login. Default credentials:
+
+- Username: `admin`
+- Password: `admin123`
+
+Override via environment variables:
+
+- `DASHBOARD_ADMIN_USER`
+- `DASHBOARD_ADMIN_PASSWORD`
+
 ### 4) Validate dashboard health
 
 ```bash
@@ -105,6 +118,16 @@ Expected output:
 ```json
 {"status":"ok"}
 ```
+
+
+### Console connectivity note (important)
+
+The dashboard only generates console tickets/URLs. For **live noVNC consoles** you must run a reachable noVNC + websockify endpoint and set:
+
+- `NOVNC_BASE_URL` (viewer URL, example: `https://novnc.example.com/vnc.html`)
+- `NOVNC_WS_BASE` (websockify URL/path, example: `wss://novnc.example.com/websockify`)
+
+If libvirt reports display host as `127.0.0.1`, dashboard automatically rewrites it to the registered host address when building the console URL metadata.
 
 ### 5) See registered hosts
 

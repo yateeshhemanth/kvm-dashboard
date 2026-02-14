@@ -48,7 +48,8 @@ from .ui_pages import render_dashboard_page
 from .libvirt_remote import LibvirtRemote, LibvirtRemoteError
 from .libvirt_cache import LibvirtCacheStore
 from .vmware_compat import build_vmware_router
-from .auth import login_get, login_post, logout_post, require_ui_auth
+from .auth import ensure_default_admin, login_get, login_post, logout_post, require_ui_auth
+from .console_service import build_console_urls
 
 app = FastAPI(title="KVM Dashboard API", version="0.7.1")
 
@@ -226,6 +227,18 @@ def _project_quota_summary() -> tuple[int, int, int]:
 @app.on_event("startup")
 def startup() -> None:
     init_db()
+    db_gen = get_db()
+    try:
+        db = next(db_gen)
+        CACHE_STORE.ensure_table(db)
+        ensure_default_admin(db)
+    except Exception:
+        pass
+    finally:
+        try:
+            next(db_gen)
+        except StopIteration:
+            pass
 
 
 @app.middleware("http")
@@ -1064,17 +1077,14 @@ def vm_console(vm_id: str, host_id: str, db: Session = Depends(get_db)) -> Conso
         raise HTTPException(status_code=404, detail="vm not found")
 
     console = _libvirt_call(host, "console_info", vm_id)
-    ticket = str(uuid4())
-    ws_url = f"{NOVNC_WS_BASE}?{urlencode({'host_id': host_id, 'vm_id': vm_id, 'ticket': ticket})}"
-    viewer_query = urlencode({
-        "host_id": host_id,
-        "vm_id": vm_id,
-        "ticket": ticket,
-        "path": ws_url,
-        "autoconnect": 1,
-        "resize": "remote",
-    })
-    novnc_url = f"{NOVNC_BASE_URL}?{viewer_query}"
+    ticket, novnc_url, console_meta = build_console_urls(
+        novnc_base_url=NOVNC_BASE_URL,
+        novnc_ws_base=NOVNC_WS_BASE,
+        host_id=host_id,
+        vm_id=vm_id,
+        host_address=host.address,
+        display_uri=str(console.get("display_uri") or ""),
+    )
 
     session = {
         "session_id": str(uuid4()),
@@ -1083,7 +1093,8 @@ def vm_console(vm_id: str, host_id: str, db: Session = Depends(get_db)) -> Conso
         "ticket": ticket,
         "novnc_url": novnc_url,
         "display_uri": console.get("display_uri"),
-        "vnc_port": str(console.get("vnc_port") or ""),
+        "vnc_host": console_meta.get("vnc_host", ""),
+        "vnc_port": console_meta.get("vnc_port", ""),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     CONSOLE_SESSIONS.insert(0, session)

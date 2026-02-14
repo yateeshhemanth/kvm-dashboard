@@ -163,11 +163,19 @@ def render_dashboard_page(
           async function api(path, method='GET', body=null) {{
             const resp = await fetch((base || '') + path, {{
               method,
+              credentials: 'same-origin',
               headers: {{ 'Content-Type': 'application/json' }},
               body: body ? JSON.stringify(body) : null,
             }});
-            const data = await resp.json();
-            if (!resp.ok) throw new Error(data.detail || 'Request failed');
+            const ctype = resp.headers.get('content-type') || '';
+            const isJson = ctype.includes('application/json');
+            const data = isJson ? await resp.json() : await resp.text();
+            if (!resp.ok) {{
+              if (!isJson && typeof data === 'string' && data.toLowerCase().includes('<!doctype html')) {{
+                throw new Error('Session expired. Please login again.');
+              }}
+              throw new Error((isJson && data?.detail) || 'Request failed');
+            }}
             return data;
           }}
 

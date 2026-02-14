@@ -72,7 +72,29 @@ class LibvirtRemote:
         }
         self._run(mapping[action])
 
+    def _disk_source_from_image(self, image: str) -> str:
+        image = (image or "").strip()
+        if not image:
+            return ""
+        if "::" in image:
+            pool, _, vol = image.partition("::")
+            if pool and vol:
+                try:
+                    return self._run(["vol-path", vol, "--pool", pool])
+                except LibvirtRemoteError:
+                    return ""
+        if image.startswith("/"):
+            return image
+        return ""
+
     def create_vm(self, name: str, cpu_cores: int, memory_mb: int, image: str, network: str = "default") -> dict[str, Any]:
+        disk_path = self._disk_source_from_image(image)
+        disk_xml = f"""<disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='{disk_path}'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>""" if disk_path else ""
+
         domain_xml = f"""
 <domain type='kvm'>
   <name>{name}</name>
@@ -99,6 +121,7 @@ class LibvirtRemote:
       <source network='{network}'/>
       <model type='virtio'/>
     </interface>
+    {disk_xml}
     <graphics type='vnc' autoport='yes' listen='0.0.0.0'/>
     <console type='pty'/>
     <serial type='pty'/>
@@ -123,6 +146,7 @@ class LibvirtRemote:
             "power_state": "stopped",
             "networks": [network],
             "created_at": datetime.now(timezone.utc).isoformat(),
+            "disk_source": disk_path or None,
         }
 
     def console_info(self, vm_id: str) -> dict[str, Any]:
