@@ -54,6 +54,8 @@ from .console_service import build_console_urls
 app = FastAPI(title="KVM Dashboard API", version="0.7.1")
 
 LIBVIRT_CACHE_TTL_S = int(os.getenv("LIBVIRT_CACHE_TTL_S", "60"))
+LIVE_STATUS_TTL_S = int(os.getenv("LIVE_STATUS_TTL_S", "15"))
+CONSOLE_SESSION_TTL_S = int(os.getenv("CONSOLE_SESSION_TTL_S", "30"))
 NOVNC_BASE_URL = os.getenv("NOVNC_BASE_URL", "/console/noVNC/viewer")
 NOVNC_WS_BASE = os.getenv("NOVNC_WS_BASE", "/console/noVNC/websockify")
 BASE_PATH = os.getenv("DASHBOARD_BASE_PATH", "").strip()
@@ -120,6 +122,7 @@ PENDING_TASKS: list[dict[str, str]] = [
 ]
 
 CACHE_STORE = LibvirtCacheStore(ttl_s=LIBVIRT_CACHE_TTL_S)
+LIVE_STATUS_CACHE: dict[str, Any] = {"updated_at": 0.0, "payload": None}
 
 
 def _with_base(path: str) -> str:
@@ -1071,10 +1074,23 @@ def overview(db: Session = Depends(get_db)) -> dict:
 @app.get("/api/v1/vms/{vm_id}/console", response_model=ConsoleTicketResponse)
 def vm_console(vm_id: str, host_id: str, db: Session = Depends(get_db)) -> ConsoleTicketResponse:
     host = _get_host_or_404(db, host_id)
-    state = _host_cached_state(db, host)
-    vm = next((item for item in state["vms"] if item.get("vm_id") == vm_id), None)
-    if not vm:
-        raise HTTPException(status_code=404, detail="vm not found")
+
+    now_ts = time.time()
+    for item in CONSOLE_SESSIONS:
+        if item.get("host_id") != host_id or item.get("vm_id") != vm_id:
+            continue
+        created = item.get("created_at", "")
+        try:
+            created_ts = datetime.fromisoformat(created.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            created_ts = 0.0
+        if (now_ts - created_ts) <= CONSOLE_SESSION_TTL_S and item.get("novnc_url"):
+            return ConsoleTicketResponse(
+                host_id=host_id,
+                vm_id=vm_id,
+                ticket=item.get("ticket", ""),
+                noVNC_url=item.get("novnc_url", ""),
+            )
 
     console = _libvirt_call(host, "console_info", vm_id)
     ticket, novnc_url, console_meta = build_console_urls(
@@ -1098,6 +1114,7 @@ def vm_console(vm_id: str, host_id: str, db: Session = Depends(get_db)) -> Conso
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     CONSOLE_SESSIONS.insert(0, session)
+    del CONSOLE_SESSIONS[200:]
     _record_event("vm.console.ticket", f"console ticket requested for vm {vm_id} on host {host_id}")
     return ConsoleTicketResponse(
         host_id=host_id,
@@ -1198,7 +1215,13 @@ def get_task(task_id: str) -> TaskRecord:
 
 
 @app.get("/api/v1/live/status")
-def live_status(db: Session = Depends(get_db)) -> dict:
+def live_status(refresh: bool = False, db: Session = Depends(get_db)) -> dict:
+    now_ts = datetime.now(timezone.utc).timestamp()
+    cached = LIVE_STATUS_CACHE.get("payload")
+    cached_at = float(LIVE_STATUS_CACHE.get("updated_at", 0.0) or 0.0)
+    if not refresh and cached and (now_ts - cached_at) <= LIVE_STATUS_TTL_S:
+        return cached
+
     hosts = db.query(Host).all()
     items: list[dict[str, Any]] = []
     for host in hosts:
@@ -1220,7 +1243,10 @@ def live_status(db: Session = Depends(get_db)) -> dict:
                 "libvirt_uri": host.libvirt_uri,
             }
         )
-    return {"count": len(items), "items": items, "timestamp": datetime.now(timezone.utc).isoformat()}
+    payload = {"count": len(items), "items": items, "timestamp": datetime.now(timezone.utc).isoformat(), "cache_ttl_s": LIVE_STATUS_TTL_S}
+    LIVE_STATUS_CACHE["updated_at"] = now_ts
+    LIVE_STATUS_CACHE["payload"] = payload
+    return payload
 
 @app.get("/api/v1/console/novnc/status")
 def novnc_status() -> dict:

@@ -4,6 +4,8 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
+import time
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
@@ -14,17 +16,55 @@ class LibvirtRemoteError(RuntimeError):
 
 
 class LibvirtRemote:
+    _semaphore: threading.BoundedSemaphore | None = None
+    _semaphore_size: int | None = None
+    _semaphore_lock = threading.Lock()
+
     def __init__(self, uri: str) -> None:
         self.uri = uri
+        self.timeout_s = int(os.getenv("LIBVIRT_CMD_TIMEOUT_S", "8"))
+        self.max_concurrency = max(1, int(os.getenv("LIBVIRT_MAX_CONCURRENCY", "2")))
+        self.retry_count = max(0, int(os.getenv("LIBVIRT_FORK_RETRY_COUNT", "2")))
+        self.retry_sleep_s = max(0.0, float(os.getenv("LIBVIRT_FORK_RETRY_SLEEP_S", "0.25")))
+
+    @classmethod
+    def _get_semaphore(cls, size: int) -> threading.BoundedSemaphore:
+        with cls._semaphore_lock:
+            if cls._semaphore is None or cls._semaphore_size != size:
+                cls._semaphore = threading.BoundedSemaphore(size)
+                cls._semaphore_size = size
+            return cls._semaphore
 
     def _run(self, args: list[str]) -> str:
         cmd = ["virsh", "-c", self.uri, *args]
+        semaphore = self._get_semaphore(self.max_concurrency)
+        acquire_timeout = max(self.timeout_s + 1, 5)
+        if not semaphore.acquire(timeout=acquire_timeout):
+            raise LibvirtRemoteError("libvirt command queue saturated; try again")
         try:
-            return subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True).strip()
-        except FileNotFoundError as exc:
-            raise LibvirtRemoteError("virsh not installed on dashboard host") from exc
-        except subprocess.CalledProcessError as exc:
-            raise LibvirtRemoteError(exc.output.strip() or "virsh command failed") from exc
+            attempts = self.retry_count + 1
+            for attempt in range(attempts):
+                try:
+                    return subprocess.check_output(
+                        cmd,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        timeout=self.timeout_s,
+                    ).strip()
+                except FileNotFoundError as exc:
+                    raise LibvirtRemoteError("virsh not installed on dashboard host") from exc
+                except subprocess.TimeoutExpired as exc:
+                    raise LibvirtRemoteError(
+                        f"virsh command timed out after {self.timeout_s}s: {' '.join(cmd)}"
+                    ) from exc
+                except subprocess.CalledProcessError as exc:
+                    output = exc.output.strip() or "virsh command failed"
+                    if "cannot fork child process" in output and attempt < attempts - 1:
+                        time.sleep(self.retry_sleep_s)
+                        continue
+                    raise LibvirtRemoteError(output) from exc
+        finally:
+            semaphore.release()
 
     def health(self) -> dict[str, Any]:
         out = self._run(["list", "--all", "--name"])

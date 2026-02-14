@@ -715,7 +715,12 @@ export NOVNC_WS_BASE=wss://novnc.example.com/websockify
 
 To reduce repeated `virsh` process spawning and PID pressure on hosts/containers, dashboard now caches per-host VM/network/image/storage snapshots in PostgreSQL table `host_libvirt_cache`.
 
-- Cache TTL env: `LIBVIRT_CACHE_TTL_S` (default: `15`)
+- Cache TTL env: `LIBVIRT_CACHE_TTL_S` (default: `60`)
+- Live status cache TTL env: `LIVE_STATUS_TTL_S` (default: `15`)
+- Virsh command timeout env: `LIBVIRT_CMD_TIMEOUT_S` (default: `8`)
+- Console ticket reuse TTL env: `CONSOLE_SESSION_TTL_S` (default: `30`)
+- Max concurrent virsh commands env: `LIBVIRT_MAX_CONCURRENCY` (default: `2`)
+- Fork retry tuning envs: `LIBVIRT_FORK_RETRY_COUNT` (default: `2`), `LIBVIRT_FORK_RETRY_SLEEP_S` (default: `0.25`)
 - Endpoints support `?refresh=true` to force recrawl from libvirt.
 
 This improves UI responsiveness while keeping operations functional (power, resize, snapshots, console ticket, etc.).
