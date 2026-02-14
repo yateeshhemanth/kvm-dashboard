@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 
 
 class HostRegisterRequest(BaseModel):
-    host_id: str = Field(..., description="Unique ID for host agent")
+    host_id: str = Field(..., description="Unique ID for hypervisor host")
     name: str
     address: str
     cpu_cores: int = 0

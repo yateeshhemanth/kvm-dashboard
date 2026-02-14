@@ -6,7 +6,7 @@ NAV_GROUPS = [
     ("Observe", [("dashboard", "Overview", "/dashboard"), ("events", "Events", "/events"), ("tasks", "Tasks", "/tasks")]),
     ("Workloads", [("vms", "Virtual Machines", "/vms"), ("console", "Console", "/console")]),
     ("Infrastructure", [("networks", "Networks", "/networks"), ("storage", "Storage pools", "/storage"), ("images", "Images", "/images")]),
-    ("Administration", [("projects", "Projects", "/projects"), ("policies", "Policies", "/policies")]),
+    ("Administration", [("policies", "Policies", "/policies"), ("guide", "Operations Guide", "/guide")]),
 ]
 
 PAGE_CONFIG: dict[str, dict[str, str]] = {
@@ -16,10 +16,10 @@ PAGE_CONFIG: dict[str, dict[str, str]] = {
     "console": {"title": "Console", "description": "Request and track VM console sessions."},
     "networks": {"title": "Networks", "description": "Create virtual networks and inspect host networks."},
     "images": {"title": "Images", "description": "qcow2 image catalog and import pipeline."},
-    "projects": {"title": "Projects", "description": "Tenancy and quota controls."},
     "policies": {"title": "Policies", "description": "Governance and action control policies."},
     "events": {"title": "Events", "description": "Operational timeline for troubleshooting."},
     "tasks": {"title": "Tasks", "description": "Automation task history and retries."},
+    "guide": {"title": "Operations Guide", "description": "Usage guide for all live platform operations."},
 }
 
 
@@ -110,7 +110,6 @@ def render_dashboard_page(
             <div class='cards'>
               <div class='card'><strong>Hosts</strong><div>{stats['hosts']}</div></div>
               <div class='card'><strong>Ready</strong><div>{stats['ready_hosts']}</div></div>
-              <div class='card'><strong>Projects</strong><div>{stats['projects']}</div></div>
               <div class='card'><strong>Policies</strong><div>{stats['policies']}</div></div>
             </div>
             <div class='card' id='actions'></div>
@@ -245,10 +244,10 @@ def render_dashboard_page(
             const rows = [
               ['Hosts total', ov.hosts.total, 'Ready', ov.hosts.ready],
               ['CPU cores', ov.hosts.total_cpu_cores, 'Memory MB', ov.hosts.total_memory_mb],
-              ['Projects', ov.projects.total, 'Policies', ov.policies.total],
-              ['Events', ov.events.total, 'Tasks', ov.tasks.total],
+              ['Policies', ov.policies.total, 'Events', ov.events.total],
+              ['Tasks', ov.tasks.total, 'Libvirt mode', 'live+cache'],
             ];
-            const hostRows = (live.items || []).map(h => [h.host_id, h.status, h.agent_reachable ? 'reachable' : 'down', h.execution, h.libvirt_uri]);
+            const hostRows = (live.items || []).map(h => [h.host_id, h.status, h.libvirt_reachable ? 'reachable' : 'down', h.execution, h.libvirt_uri]);
             content.innerHTML = `<strong>Cluster summary</strong>${{table(['Metric','Value','Metric','Value'], rows)}}<div style='margin-top:10px'><strong>Live host API status</strong>${{table(['Host','Status','Libvirt Reachability','Execution','Libvirt URI'], hostRows)}}</div>`;
             bindSearch();
           }}
@@ -648,6 +647,15 @@ Recovery ISO: ${{vm.annotations?.['recovery.iso'] || 'not attached'}}`);
             bindSearch();
           }}
 
+
+          async function loadGuide() {{
+            actions.innerHTML = `<strong>Operations guide</strong><div class='muted'>Step-by-step usage for all supported live libvirt operations.</div>`;
+            const doc = await api('/api/v1/operations-guide');
+            const sections = (doc.sections || []).map(sec => `<div class='card'><strong>${{sec.title}}</strong><ul>${{(sec.steps||[]).map(st => `<li>${{st}}</li>`).join('')}}</ul></div>`).join('');
+            content.innerHTML = `<strong>How to use this platform</strong><div class='muted'>${{doc.summary || ''}}</div><div class='cards'>${{sections}}</div>`;
+            bindSearch();
+          }}
+
           async function loadSimple(path, title, cols, mapper) {{
             actions.innerHTML = `<strong>${{title}}</strong>`;
             const data = await api(path);
@@ -665,8 +673,8 @@ Recovery ISO: ${{vm.annotations?.['recovery.iso'] || 'not attached'}}`);
             console: loadConsole,
             events: loadEvents,
             tasks: loadTasks,
-            projects: () => loadSimple('/api/v1/projects', 'Projects', ['Project','Description','CPU quota','Memory quota','VM limit'], d => d.map(p => [p.name,p.description,p.cpu_cores_quota,p.memory_mb_quota,p.vm_limit])),
             policies: loadPolicies,
+            guide: loadGuide,
           }};
 
           let refreshTimer = null;

@@ -6,6 +6,9 @@ This repository now contains a **working starter implementation** of:
 
 The goal is to give you a clean base to build a full OpenShift-inspired operations platform (VM lifecycle, network operations, noVNC, qcow2 image lifecycle, policy, and day-2 automation).
 
+> **Current mode:** Dashboard operates in direct libvirt-live mode with PostgreSQL cache.
+> Host-agent mock execution paths are deprecated and should not be used for VM/network/image operations.
+
 ---
 
 ## What is included now
@@ -263,7 +266,7 @@ curl -X POST http://127.0.0.1:9090/agent/push-now
 - `POST /api/v1/runbooks/{runbook_name}/execute`
 - `GET /api/v1/tasks`
 - `GET /api/v1/tasks/{task_id}`
-- `GET /api/v1/hosts/{host_id}/agent-health`
+- `GET /api/v1/hosts/{host_id}/libvirt-health`
 - `GET /api/v1/backbone/check`
 
 ## Next phase delivered in this commit
@@ -730,3 +733,10 @@ This improves UI responsiveness while keeping operations functional (power, resi
 
 ### Direct architecture
 Dashboard (10.110.17.160) connects directly to registered hosts using each host `libvirt_uri` such as `qemu+ssh://root@10.110.17.153/system`. No host-agent process is required on `.153` for core operations. Multiple hosts are supported by adding multiple host records.
+
+
+## Operations guide page
+
+- UI route: `/guide`
+- API source: `GET /api/v1/operations-guide`
+- Contains step-by-step usage for host registration, VM lifecycle, network/storage/image, console, events, and tasks.

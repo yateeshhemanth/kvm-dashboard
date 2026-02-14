@@ -330,7 +330,9 @@ class LibvirtRemote:
         for pool in self.list_storage_pools():
             for vol in pool.get("volumes", []):
                 if vol["name"].endswith((".qcow2", ".iso", ".img")):
-                    images.append({"image_id": f"{pool['name']}::{vol['name']}", "name": vol["name"], "source_url": pool["name"], "status": "available", "used_by": vol.get("used_by", "-"), "created_at": datetime.now(timezone.utc).isoformat()})
+                    used_by = vol.get("used_by", "-")
+                    in_use = bool(used_by and used_by != "-")
+                    images.append({"image_id": f"{pool['name']}::{vol['name']}", "name": vol["name"], "source_url": pool["name"], "status": "in-use" if in_use else "available", "used_by": used_by, "created_at": datetime.now(timezone.utc).isoformat(), "tags": ["in-use"] if in_use else []})
         return images
 
 

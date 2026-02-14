@@ -138,7 +138,6 @@ def _dashboard_route_hints() -> list[str]:
         _with_base("/console"),
         _with_base("/networks"),
         _with_base("/images"),
-        _with_base("/projects"),
         _with_base("/policies"),
         _with_base("/events"),
         _with_base("/tasks"),
@@ -356,7 +355,6 @@ def _render_ui_page(page: str, db: Session) -> str:
     stats = {
         "hosts": len(hosts),
         "ready_hosts": len([host for host in hosts if host.status in {"ready", "registered"}]),
-        "projects": len(PROJECTS),
         "policies": len(POLICIES),
     }
     return render_dashboard_page(page, base_path=BASE_PATH, stats=stats)
@@ -378,10 +376,10 @@ def dashboard_home(_user=Depends(require_ui_auth), db: Session = Depends(get_db)
 @app.get("/console", response_class=HTMLResponse)
 @app.get("/networks", response_class=HTMLResponse)
 @app.get("/images", response_class=HTMLResponse)
-@app.get("/projects", response_class=HTMLResponse)
 @app.get("/policies", response_class=HTMLResponse)
 @app.get("/events", response_class=HTMLResponse)
 @app.get("/tasks", response_class=HTMLResponse)
+@app.get("/guide", response_class=HTMLResponse)
 def dashboard_sections(request: Request, _user=Depends(require_ui_auth), db: Session = Depends(get_db)) -> str:
     page = request.url.path.strip("/").split("/")[0] or "dashboard"
     return _render_ui_page(page, db)
@@ -702,12 +700,12 @@ def detach_network(network_id: str, payload: NetworkDetachRequest, db: Session =
     return {"host_id": payload.host_id, "result": {"status": "detached", "network_id": network_id, "vm_id": payload.vm_id}}
 
 
-@app.get("/api/v1/hosts/{host_id}/agent-health")
-def host_agent_health(host_id: str, db: Session = Depends(get_db)) -> dict:
+@app.get("/api/v1/hosts/{host_id}/libvirt-health")
+def host_libvirt_health(host_id: str, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, host_id)
     status = _libvirt_call(host, "health")
     _record_event("libvirt.health.ok", f"libvirt health check ok for host {host_id}")
-    return {"host_id": host_id, "agent": status}
+    return {"host_id": host_id, "libvirt": status}
 
 
 @app.get("/api/v1/backbone/check")
@@ -718,8 +716,7 @@ def api_backbone_check(db: Session = Depends(get_db)) -> dict:
         "api_version": "0.7.1",
         "features": {
             "hosts": len(hosts),
-            "projects": len(PROJECTS),
-            "events": len(EVENTS),
+                "events": len(EVENTS),
             "tasks": len(TASKS),
             "runbooks": "enabled",
             "console": "enabled",
@@ -825,7 +822,6 @@ def dashboard_diagnostics(db: Session = Depends(get_db)) -> dict:
         "ui_routes": _dashboard_route_hints(),
         "host_count": len(hosts),
         "ready_hosts": len([host for host in hosts if host.status in {"ready", "registered"}]),
-        "project_count": len(PROJECTS),
         "policy_count": len(POLICIES),
         "event_count": len(EVENTS),
         "task_count": len(TASKS),
@@ -985,7 +981,6 @@ def capabilities() -> dict:
             "vm_lifecycle": True,
             "network_operations": True,
             "image_lifecycle": True,
-            "projects_quotas": True,
             "runbooks_tasks_events": True,
             "policies": True,
             "console_ticket_placeholder": False,
@@ -1080,6 +1075,20 @@ def list_events(limit: int = 50, event_type: str | None = None, since: str | Non
     if since:
         events = [event for event in events if event.created_at >= since]
     return events[: min(limit, 200)]
+
+
+@app.get("/api/v1/operations-guide")
+def operations_guide() -> dict:
+    return {
+        "summary": "Live libvirt + PostgreSQL cache workflow. No host-agent dependency.",
+        "sections": [
+            {"title": "1) Register host", "steps": ["Go to Overview and verify host appears in Live host status", "Ensure libvirt URI is reachable and health is green"]},
+            {"title": "2) VM lifecycle", "steps": ["Open Virtual Machines page", "Use Provision / Import section for creation", "Use action buttons for start/stop/reboot/pause/resume/delete"]},
+            {"title": "3) Networks and storage", "steps": ["Use Networks page for create/delete/attach/detach", "Use Storage and Images pages to inspect pools, qcow2 volumes, and used-by tags"]},
+            {"title": "4) Console", "steps": ["Open Console page or VM row console action", "noVNC URL is generated from libvirt display + configured NOVNC paths"]},
+            {"title": "5) Events and tasks", "steps": ["Use Events page to audit operation timeline", "Use Tasks page for operation records and retries"]},
+        ],
+    }
 
 
 @app.get("/api/v1/overview")
@@ -1266,11 +1275,11 @@ def live_status(refresh: bool = False, db: Session = Depends(get_db)) -> dict:
     hosts = db.query(Host).all()
     items: list[dict[str, Any]] = []
     for host in hosts:
-        agent_ok = False
+        libvirt_ok = False
         detail = "unreachable"
         try:
             status = _libvirt_call(host, "health")
-            agent_ok = bool(status.get("reachable"))
+            libvirt_ok = bool(status.get("reachable"))
             detail = "libvirt-direct"
         except HTTPException:
             pass
@@ -1279,7 +1288,7 @@ def live_status(refresh: bool = False, db: Session = Depends(get_db)) -> dict:
                 "host_id": host.host_id,
                 "address": host.address,
                 "status": host.status,
-                "agent_reachable": agent_ok,
+                "libvirt_reachable": libvirt_ok,
                 "execution": detail,
                 "libvirt_uri": host.libvirt_uri,
             }
