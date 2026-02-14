@@ -1,13 +1,11 @@
 from datetime import datetime, timezone
-import json
 import os
 import time
 from typing import Any
 from uuid import uuid4
 from urllib.parse import urlencode
 
-import requests
-from fastapi import Depends, FastAPI, Form, HTTPException, Request
+from fastapi import Depends, FastAPI, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -50,12 +48,16 @@ from .schemas_day2 import VMOperationTaskRequest, VMRecoveryISOReleaseRequest, V
 from .day2_services import SUPPORTED_VM_TASK_TYPES, normalize_task_type
 from .ui_pages import render_dashboard_page
 from .libvirt_remote import LibvirtRemote, LibvirtRemoteError
+from .libvirt_cache import LibvirtCacheStore
+from .vmware_compat import build_vmware_router
+from .auth import ensure_default_admin, login_get, login_post, logout_post, require_ui_auth
+from .console_service import build_console_urls
 
 app = FastAPI(title="KVM Dashboard API", version="0.7.1")
 
-AGENT_PORT = 9090
-AGENT_TIMEOUT_S = 10
-LIBVIRT_CACHE_TTL_S = int(os.getenv("LIBVIRT_CACHE_TTL_S", "15"))
+LIBVIRT_CACHE_TTL_S = int(os.getenv("LIBVIRT_CACHE_TTL_S", "60"))
+LIVE_STATUS_TTL_S = int(os.getenv("LIVE_STATUS_TTL_S", "15"))
+CONSOLE_SESSION_TTL_S = int(os.getenv("CONSOLE_SESSION_TTL_S", "30"))
 NOVNC_BASE_URL = os.getenv("NOVNC_BASE_URL", "/console/noVNC/viewer")
 NOVNC_WS_BASE = os.getenv("NOVNC_WS_BASE", "/console/noVNC/websockify")
 BASE_PATH = os.getenv("DASHBOARD_BASE_PATH", "").strip()
@@ -121,6 +123,9 @@ PENDING_TASKS: list[dict[str, str]] = [
     {"id": "PEND-007", "area": "Platform", "task": "Add metrics endpoint and Prometheus export", "priority": "medium"},
 ]
 
+CACHE_STORE = LibvirtCacheStore(ttl_s=LIBVIRT_CACHE_TTL_S)
+LIVE_STATUS_CACHE: dict[str, Any] = {"updated_at": 0.0, "payload": None}
+
 
 def _with_base(path: str) -> str:
     return f"{BASE_PATH}{path}" if BASE_PATH else path
@@ -135,7 +140,6 @@ def _dashboard_route_hints() -> list[str]:
         _with_base("/console"),
         _with_base("/networks"),
         _with_base("/images"),
-        _with_base("/projects"),
         _with_base("/policies"),
         _with_base("/events"),
         _with_base("/tasks"),
@@ -206,6 +210,44 @@ def _enforce_policies(action: str, host_id: str | None = None, project_id: str |
         if action in blocked:
             raise HTTPException(status_code=403, detail=f"policy {policy.name} blocks action '{action}'")
 
+
+
+def _actor_role(request: Request) -> str:
+    return request.headers.get("x-role", "admin").strip().lower() or "admin"
+
+
+def _require_roles(request: Request, allowed: set[str]) -> str:
+    role = _actor_role(request)
+    if role not in allowed:
+        raise HTTPException(status_code=403, detail=f"rbac denied for role={role}; allowed={sorted(allowed)}")
+    return role
+def _tags_to_csv(tags: list[str] | None) -> str:
+    if not tags:
+        return ""
+    return ",".join(sorted({t.strip() for t in tags if t and t.strip()}))
+
+
+def _csv_to_tags(tags_csv: str | None) -> list[str]:
+    if not tags_csv:
+        return []
+    return [item.strip() for item in tags_csv.split(",") if item.strip()]
+
+
+def _host_to_response(host: Host) -> HostResponse:
+    return HostResponse(
+        host_id=host.host_id,
+        name=host.name,
+        address=host.address,
+        status=host.status,
+        cpu_cores=host.cpu_cores,
+        memory_mb=host.memory_mb,
+        libvirt_uri=host.libvirt_uri,
+        tags=_csv_to_tags(getattr(host, "tags", "")),
+        project_id=getattr(host, "project_id", None),
+        last_heartbeat=host.last_heartbeat,
+    )
+
+
 def _project_quota_summary() -> tuple[int, int, int]:
     total_cpu = sum(project.cpu_cores_quota for project in PROJECTS.values())
     total_memory = sum(project.memory_mb_quota for project in PROJECTS.values())
@@ -216,6 +258,21 @@ def _project_quota_summary() -> tuple[int, int, int]:
 @app.on_event("startup")
 def startup() -> None:
     init_db()
+    db_gen = get_db()
+    try:
+        db = next(db_gen)
+        CACHE_STORE.ensure_table(db)
+        db.execute(text("ALTER TABLE hosts ADD COLUMN IF NOT EXISTS tags VARCHAR(1024) DEFAULT ''"))
+        db.execute(text("ALTER TABLE hosts ADD COLUMN IF NOT EXISTS project_id VARCHAR(128)"))
+        db.commit()
+        ensure_default_admin(db)
+    except Exception:
+        pass
+    finally:
+        try:
+            next(db_gen)
+        except StopIteration:
+            pass
 
 
 @app.middleware("http")
@@ -234,6 +291,22 @@ def healthz() -> dict[str, str]:
     return {"status": "ok", "base_path": BASE_PATH or "/"}
 
 
+
+
+@app.get("/login", response_class=HTMLResponse)
+def dashboard_login_page(db: Session = Depends(get_db)) -> HTMLResponse:
+    return login_get(db)
+
+
+@app.post("/login")
+def dashboard_login_submit(username: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)):
+    return login_post(username=username, password=password, db=db)
+
+
+@app.post("/logout")
+def dashboard_logout(request: Request, db: Session = Depends(get_db)):
+    return logout_post(request=request, db=db)
+
 def _apply_host_action(host: Host, action: HostAction) -> None:
     if action == HostAction.mark_ready:
         host.status = "ready"
@@ -243,26 +316,6 @@ def _apply_host_action(host: Host, action: HostAction) -> None:
         host.status = "draining"
     elif action == HostAction.disable:
         host.status = "disabled"
-
-
-def _agent_base_url(host: Host) -> str:
-    return f"http://{host.address}:{AGENT_PORT}"
-
-
-def _fetch_agent_json(method: str, url: str, *, json_payload: dict | None = None) -> Any:
-    try:
-        if method == "GET":
-            response = requests.get(url, timeout=AGENT_TIMEOUT_S)
-        elif method == "POST":
-            response = requests.post(url, json=json_payload, timeout=AGENT_TIMEOUT_S)
-        elif method == "DELETE":
-            response = requests.delete(url, timeout=AGENT_TIMEOUT_S)
-        else:
-            raise ValueError(f"unsupported method: {method}")
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"agent request failed: {exc}") from exc
 
 
 
@@ -284,68 +337,13 @@ def _libvirt_call(host: Host, fn_name: str, *args):
 
 
 
-def _ensure_libvirt_cache_table(db: Session) -> None:
-    db.execute(text("""
-        CREATE TABLE IF NOT EXISTS host_libvirt_cache (
-            host_id VARCHAR(128) PRIMARY KEY,
-            vms_json TEXT NOT NULL,
-            networks_json TEXT NOT NULL,
-            images_json TEXT NOT NULL,
-            pools_json TEXT NOT NULL,
-            updated_at DOUBLE PRECISION NOT NULL
-        )
-    """))
-    db.commit()
-
-
 def _refresh_host_cache(db: Session, host: Host) -> dict[str, Any]:
-    vms = _libvirt_call(host, "list_vms")
-    networks = _libvirt_call(host, "list_networks")
-    images = _libvirt_call(host, "list_images")
-    pools = _libvirt_call(host, "list_storage_pools")
-    now = time.time()
-    _ensure_libvirt_cache_table(db)
-    db.execute(
-        text("""
-            INSERT INTO host_libvirt_cache(host_id, vms_json, networks_json, images_json, pools_json, updated_at)
-            VALUES (:host_id, :vms_json, :networks_json, :images_json, :pools_json, :updated_at)
-            ON CONFLICT(host_id) DO UPDATE SET
-              vms_json=excluded.vms_json,
-              networks_json=excluded.networks_json,
-              images_json=excluded.images_json,
-              pools_json=excluded.pools_json,
-              updated_at=excluded.updated_at
-        """),
-        {
-            "host_id": host.host_id,
-            "vms_json": json.dumps(vms),
-            "networks_json": json.dumps(networks),
-            "images_json": json.dumps(images),
-            "pools_json": json.dumps(pools),
-            "updated_at": now,
-        },
-    )
-    db.commit()
-    return {"vms": vms, "networks": networks, "images": images, "pools": pools, "updated_at": now, "cache": "miss"}
+    return CACHE_STORE.refresh(db, host, _libvirt_call)
 
 
 def _host_cached_state(db: Session, host: Host, *, force_refresh: bool = False) -> dict[str, Any]:
-    _ensure_libvirt_cache_table(db)
-    if not force_refresh:
-        row = db.execute(
-            text("SELECT vms_json, networks_json, images_json, pools_json, updated_at FROM host_libvirt_cache WHERE host_id=:host_id"),
-            {"host_id": host.host_id},
-        ).first()
-        if row and (time.time() - float(row.updated_at) <= LIBVIRT_CACHE_TTL_S):
-            return {
-                "vms": json.loads(row.vms_json),
-                "networks": json.loads(row.networks_json),
-                "images": json.loads(row.images_json),
-                "pools": json.loads(row.pools_json),
-                "updated_at": float(row.updated_at),
-                "cache": "hit",
-            }
-    return _refresh_host_cache(db, host)
+    return CACHE_STORE.get(db, host, _libvirt_call, force_refresh=force_refresh)
+
 
 def _get_host_or_404(db: Session, host_id: str) -> Host:
     host = db.query(Host).filter(Host.host_id == host_id).first()
@@ -359,17 +357,9 @@ def _render_ui_page(page: str, db: Session) -> str:
     stats = {
         "hosts": len(hosts),
         "ready_hosts": len([host for host in hosts if host.status in {"ready", "registered"}]),
-        "projects": len(PROJECTS),
         "policies": len(POLICIES),
     }
-    diagnostics = [
-        ("Base Path", BASE_PATH or "/"),
-        ("Execution Backend", "Phase 6 foundation enabled"),
-        ("Console UX", "Phase 7 foundation enabled"),
-        ("Policy + Audit", "Phase 8 foundation enabled"),
-        ("Pending Tasks", str(len(PENDING_TASKS))),
-    ]
-    return render_dashboard_page(page, base_path=BASE_PATH, stats=stats, diagnostics=diagnostics)
+    return render_dashboard_page(page, base_path=BASE_PATH, stats=stats)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -379,7 +369,7 @@ def _render_ui_page(page: str, db: Session) -> str:
 @app.get("/ui/", response_class=HTMLResponse)
 @app.get("/index.html", response_class=HTMLResponse)
 @app.get("/home", response_class=HTMLResponse)
-def dashboard_home(db: Session = Depends(get_db)) -> str:
+def dashboard_home(_user=Depends(require_ui_auth), db: Session = Depends(get_db)) -> str:
     return _render_ui_page("dashboard", db)
 
 
@@ -388,11 +378,11 @@ def dashboard_home(db: Session = Depends(get_db)) -> str:
 @app.get("/console", response_class=HTMLResponse)
 @app.get("/networks", response_class=HTMLResponse)
 @app.get("/images", response_class=HTMLResponse)
-@app.get("/projects", response_class=HTMLResponse)
 @app.get("/policies", response_class=HTMLResponse)
 @app.get("/events", response_class=HTMLResponse)
 @app.get("/tasks", response_class=HTMLResponse)
-def dashboard_sections(request: Request, db: Session = Depends(get_db)) -> str:
+@app.get("/guide", response_class=HTMLResponse)
+def dashboard_sections(request: Request, _user=Depends(require_ui_auth), db: Session = Depends(get_db)) -> str:
     page = request.url.path.strip("/").split("/")[0] or "dashboard"
     return _render_ui_page(page, db)
 
@@ -416,6 +406,8 @@ def register_host(payload: HostRegisterRequest, db: Session = Depends(get_db)) -
         host.cpu_cores = payload.cpu_cores
         host.memory_mb = payload.memory_mb
         host.libvirt_uri = payload.libvirt_uri
+        host.tags = _tags_to_csv(payload.tags)
+        host.project_id = payload.project_id
         host.status = "registered"
         host.last_heartbeat = datetime.now(timezone.utc)
     else:
@@ -427,13 +419,15 @@ def register_host(payload: HostRegisterRequest, db: Session = Depends(get_db)) -
             cpu_cores=payload.cpu_cores,
             memory_mb=payload.memory_mb,
             libvirt_uri=payload.libvirt_uri,
+            tags=_tags_to_csv(payload.tags),
+            project_id=payload.project_id,
             last_heartbeat=datetime.now(timezone.utc),
         )
         db.add(host)
 
     db.commit()
     db.refresh(host)
-    return host
+    return _host_to_response(host)
 
 
 @app.post("/api/v1/hosts/{host_id}/heartbeat", response_model=HostResponse)
@@ -445,7 +439,7 @@ def heartbeat(host_id: str, payload: HeartbeatRequest, db: Session = Depends(get
     host.last_heartbeat = datetime.now(timezone.utc)
     db.commit()
     db.refresh(host)
-    return host
+    return _host_to_response(host)
 
 
 @app.post("/api/v1/hosts/{host_id}/action", response_model=HostResponse)
@@ -455,7 +449,7 @@ def host_action(host_id: str, payload: HostActionRequest, db: Session = Depends(
     host.last_heartbeat = datetime.now(timezone.utc)
     db.commit()
     db.refresh(host)
-    return host
+    return _host_to_response(host)
 
 
 @app.delete("/api/v1/hosts/{host_id}")
@@ -467,16 +461,26 @@ def remove_host(host_id: str, db: Session = Depends(get_db)) -> dict[str, str]:
 
 
 @app.get("/api/v1/hosts", response_model=list[HostResponse])
-def list_hosts(db: Session = Depends(get_db)) -> list[Host]:
-    return db.query(Host).order_by(Host.id.desc()).all()
+def list_hosts(project_id: str | None = Query(default=None), tag: str | None = Query(default=None), db: Session = Depends(get_db)) -> list[HostResponse]:
+    query = db.query(Host)
+    if project_id:
+        query = query.filter(Host.project_id == project_id)
+    hosts = query.order_by(Host.id.desc()).all()
+    if tag:
+        token = tag.strip().lower()
+        hosts = [h for h in hosts if token in {t.lower() for t in _csv_to_tags(getattr(h, "tags", ""))}]
+    return [_host_to_response(h) for h in hosts]
 
 
 @app.post("/api/v1/vms/provision")
 def provision_vm(payload: VMProvisionRequest, db: Session = Depends(get_db)) -> dict:
     _enforce_policies("vm.provision", host_id=payload.host_id)
     host = _get_host_or_404(db, payload.host_id)
-    _create_completed_task("vm.provision", payload.name, f"requested cpu={payload.cpu_cores},mem={payload.memory_mb},image={payload.image}")
-    return {"host_id": payload.host_id, "vm": {"vm_id": payload.name, "name": payload.name, "cpu_cores": payload.cpu_cores, "memory_mb": payload.memory_mb, "image": payload.image, "power_state": "stopped"}, "status": "queued"}
+    vm = _libvirt_call(host, "create_vm", payload.name, payload.cpu_cores, payload.memory_mb, payload.image, payload.network)
+    _refresh_host_cache(db, host)
+    _record_event("vm.provision", f"vm {payload.name} created on host {payload.host_id}")
+    _create_completed_task("vm.provision", payload.name, f"created cpu={payload.cpu_cores},mem={payload.memory_mb},image={payload.image},network={payload.network}")
+    return {"host_id": payload.host_id, "vm": vm, "status": "created"}
 
 
 @app.post("/api/v1/vms/import")
@@ -492,40 +496,42 @@ def import_vm(payload: VMImportRequest, db: Session = Depends(get_db)) -> dict:
 def list_host_vms(host_id: str, refresh: bool = False, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, host_id)
     state = _host_cached_state(db, host, force_refresh=refresh)
-    return {"host_id": host_id, "vms": state["vms"], "cache": state["cache"], "cached_at": state["updated_at"]}
+    return {"host_id": host_id, "vms": state["vms"], "cache": state["cache"], "cached_at": state["updated_at"], "last_error": state.get("last_error"), "last_success_at": state.get("last_success_at")}
 
 
 @app.get("/api/v1/hosts/{host_id}/inventory-live")
-def host_inventory_live(host_id: str, refresh: bool = False, db: Session = Depends(get_db)) -> dict:
+def host_inventory_live(host_id: str, refresh: bool = False, include_snapshots: bool = False, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, host_id)
     state = _host_cached_state(db, host, force_refresh=refresh)
     vms, networks, images = state["vms"], state["networks"], state["images"]
     vm_snapshots: dict[str, Any] = {}
-    for vm in vms:
-        vm_id = vm.get("vm_id")
-        if vm_id:
-            vm_snapshots[vm_id] = _libvirt_call(host, "snapshot_list", vm_id)
+    if include_snapshots:
+        for vm in vms:
+            vm_id = vm.get("vm_id")
+            if vm_id:
+                vm_snapshots[vm_id] = _libvirt_call(host, "snapshot_list", vm_id)
     attachments = {vm.get("vm_id"): {"networks": vm.get("networks", []), "image": {"name": vm.get("image")}, "snapshots": vm_snapshots.get(vm.get("vm_id"), [])} for vm in vms if vm.get("vm_id")}
-    return {"host_id": host_id, "cache": state["cache"], "cached_at": state["updated_at"], "state": {"vm_count": len(vms), "network_count": len(networks), "image_count": len(images), "snapshot_count": sum(len(items) for items in vm_snapshots.values())}, "vms": vms, "networks": networks, "images": images, "attachments": attachments}
+    return {"host_id": host_id, "cache": state["cache"], "cached_at": state["updated_at"], "last_error": state.get("last_error"), "last_success_at": state.get("last_success_at"), "state": {"vm_count": len(vms), "network_count": len(networks), "image_count": len(images), "snapshot_count": sum(len(items) for items in vm_snapshots.values())}, "vms": vms, "networks": networks, "images": images, "attachments": attachments}
 
 
 @app.get("/api/v1/vms/{vm_id}/attachments")
 def vm_attachments(vm_id: str, host_id: str, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, host_id)
-    vms = _fetch_agent_json("GET", f"{_agent_base_url(host)}/agent/vms")
-    vm = next((item for item in vms if item.get("vm_id") == vm_id), None)
+    state = _host_cached_state(db, host)
+    vm = next((item for item in state["vms"] if item.get("vm_id") == vm_id), None)
     if not vm:
         raise HTTPException(status_code=404, detail="vm not found")
 
-    snapshots = _fetch_agent_json("GET", f"{_agent_base_url(host)}/agent/vms/{vm_id}/snapshots")
-    networks = _fetch_agent_json("GET", f"{_agent_base_url(host)}/agent/networks")
-    images = _fetch_agent_json("GET", f"{_agent_base_url(host)}/agent/images")
+    snapshots = _libvirt_call(host, "snapshot_list", vm_id)
+    networks = state["networks"]
+    images = state["images"]
 
-    attached_networks = [net for net in networks if vm_id in net.get("attached_vm_ids", []) or net.get("name") in vm.get("networks", [])]
+    attached_networks = [net for net in networks if net.get("name") in vm.get("networks", [])]
     image_record = next((img for img in images if img.get("name") in {vm.get("image"), f"{vm.get('image', '')}.qcow2"}), None)
 
     override = VM_METADATA_OVERRIDES.get(host_id, {}).get(vm_id, {"labels": {}, "annotations": {}})
     volume_name = f"{vm.get('name', 'vm')}-{vm_id[:8]}.qcow2"
+    current_iso = _libvirt_call(host, "current_iso", vm_id)
     return {
         "host_id": host_id,
         "vm_id": vm_id,
@@ -536,6 +542,7 @@ def vm_attachments(vm_id: str, host_id: str, db: Session = Depends(get_db)) -> d
             "networks": attached_networks,
             "snapshots": snapshots,
             "volumes": [{"name": volume_name, "format": "qcow2", "size_gb": 20}],
+            "recovery_iso": current_iso or None,
         },
     }
 
@@ -562,28 +569,22 @@ def delete_vm(vm_id: str, host_id: str, db: Session = Depends(get_db)) -> dict:
 
 
 @app.post("/api/v1/networks")
-def create_network(payload: NetworkCreateRequest, db: Session = Depends(get_db)) -> dict:
+def create_network(payload: NetworkCreateRequest, request: Request, db: Session = Depends(get_db)) -> dict:
+    _require_roles(request, {"admin", "operator"})
     _enforce_policies("network.create", host_id=payload.host_id)
     host = _get_host_or_404(db, payload.host_id)
-    url = f"{_agent_base_url(host)}/agent/networks"
-    try:
-        response = requests.post(
-            url,
-            json={"name": payload.name, "cidr": payload.cidr, "vlan_id": payload.vlan_id},
-            timeout=AGENT_TIMEOUT_S,
-        )
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"agent request failed: {exc}") from exc
-
-    return {"host_id": payload.host_id, "network": response.json()}
+    network = _libvirt_call(host, "create_network", payload.name, payload.cidr, payload.vlan_id)
+    _refresh_host_cache(db, host)
+    _record_event("network.create", f"network {payload.name} created on host {payload.host_id}")
+    _create_completed_task("network.create", payload.name, f"cidr={payload.cidr},vlan={payload.vlan_id}")
+    return {"host_id": payload.host_id, "network": network}
 
 
 @app.get("/api/v1/hosts/{host_id}/networks")
 def list_host_networks(host_id: str, refresh: bool = False, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, host_id)
     state = _host_cached_state(db, host, force_refresh=refresh)
-    return {"host_id": host_id, "networks": state["networks"], "cache": state["cache"], "cached_at": state["updated_at"]}
+    return {"host_id": host_id, "networks": state["networks"], "cache": state["cache"], "cached_at": state["updated_at"], "last_error": state.get("last_error"), "last_success_at": state.get("last_success_at")}
 
 
 @app.post("/api/v1/networks/{network_id}/attach")
@@ -594,8 +595,11 @@ def attach_network(network_id: str, payload: NetworkAttachRequest, db: Session =
 
 
 @app.delete("/api/v1/networks/{network_id}")
-def delete_network(network_id: str, host_id: str, db: Session = Depends(get_db)) -> dict:
-    _get_host_or_404(db, host_id)
+def delete_network(network_id: str, host_id: str, request: Request, db: Session = Depends(get_db)) -> dict:
+    _require_roles(request, {"admin", "operator"})
+    host = _get_host_or_404(db, host_id)
+    _libvirt_call(host, "delete_network", network_id)
+    _refresh_host_cache(db, host)
     _record_event("network.delete", f"network {network_id} deleted on {host_id}")
     return {"host_id": host_id, "result": {"status": "deleted", "network_id": network_id}}
 
@@ -632,28 +636,22 @@ def set_vm_metadata(vm_id: str, payload: VMMetadataRequest, db: Session = Depend
 
 @app.post("/api/v1/vms/{vm_id}/recovery/attach-iso")
 def attach_recovery_iso(vm_id: str, payload: VMRecoveryISORequest, db: Session = Depends(get_db)) -> dict:
-    _get_host_or_404(db, payload.host_id)
-    override = VM_METADATA_OVERRIDES.setdefault(payload.host_id, {}).setdefault(vm_id, {"labels": {}, "annotations": {}})
-    override.setdefault("labels", {})["recovery_mode"] = "enabled"
-    override.setdefault("annotations", {})["recovery.iso"] = payload.iso_path
-    override.setdefault("annotations", {})["recovery.boot_once"] = str(payload.boot_once).lower()
-    override.setdefault("annotations", {})["recovery.attached_at"] = datetime.now(timezone.utc).isoformat()
+    host = _get_host_or_404(db, payload.host_id)
+    result = _libvirt_call(host, "attach_iso", vm_id, payload.iso_path, payload.boot_once)
+    _refresh_host_cache(db, host)
     _record_event("vm.recovery.iso.attach", f"recovery ISO attached for vm {vm_id} on host {payload.host_id}")
     _create_completed_task("vm.recovery.iso.attach", vm_id, f"iso={payload.iso_path}")
-    return {"host_id": payload.host_id, "vm_id": vm_id, "status": "attached", "vm": {"vm_id": vm_id, **override}}
+    return {"host_id": payload.host_id, "vm_id": vm_id, "status": "attached", "result": result}
 
 
 @app.post("/api/v1/vms/{vm_id}/recovery/detach-iso")
 def detach_recovery_iso(vm_id: str, payload: VMRecoveryISOReleaseRequest, db: Session = Depends(get_db)) -> dict:
-    _get_host_or_404(db, payload.host_id)
-    override = VM_METADATA_OVERRIDES.setdefault(payload.host_id, {}).setdefault(vm_id, {"labels": {}, "annotations": {}})
-    override.setdefault("labels", {})["recovery_mode"] = "disabled"
-    override.setdefault("annotations", {})["recovery.iso"] = ""
-    override.setdefault("annotations", {})["recovery.boot_once"] = "false"
-    override.setdefault("annotations", {})["recovery.detached_at"] = datetime.now(timezone.utc).isoformat()
+    host = _get_host_or_404(db, payload.host_id)
+    result = _libvirt_call(host, "detach_iso", vm_id)
+    _refresh_host_cache(db, host)
     _record_event("vm.recovery.iso.detach", f"recovery ISO detached for vm {vm_id} on host {payload.host_id}")
     _create_completed_task("vm.recovery.iso.detach", vm_id, "recovery iso detached")
-    return {"host_id": payload.host_id, "vm_id": vm_id, "status": "detached", "vm": {"vm_id": vm_id, **override}}
+    return {"host_id": payload.host_id, "vm_id": vm_id, "status": "detached", "result": result}
 
 @app.post("/api/v1/vms/{vm_id}/migrate")
 def migrate_vm(vm_id: str, payload: VMMigrateRequest, db: Session = Depends(get_db)) -> dict:
@@ -704,12 +702,12 @@ def detach_network(network_id: str, payload: NetworkDetachRequest, db: Session =
     return {"host_id": payload.host_id, "result": {"status": "detached", "network_id": network_id, "vm_id": payload.vm_id}}
 
 
-@app.get("/api/v1/hosts/{host_id}/agent-health")
-def host_agent_health(host_id: str, db: Session = Depends(get_db)) -> dict:
+@app.get("/api/v1/hosts/{host_id}/libvirt-health")
+def host_libvirt_health(host_id: str, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, host_id)
     status = _libvirt_call(host, "health")
     _record_event("libvirt.health.ok", f"libvirt health check ok for host {host_id}")
-    return {"host_id": host_id, "agent": status}
+    return {"host_id": host_id, "libvirt": status}
 
 
 @app.get("/api/v1/backbone/check")
@@ -720,8 +718,7 @@ def api_backbone_check(db: Session = Depends(get_db)) -> dict:
         "api_version": "0.7.1",
         "features": {
             "hosts": len(hosts),
-            "projects": len(PROJECTS),
-            "events": len(EVENTS),
+                "events": len(EVENTS),
             "tasks": len(TASKS),
             "runbooks": "enabled",
             "console": "enabled",
@@ -733,47 +730,36 @@ def api_backbone_check(db: Session = Depends(get_db)) -> dict:
 def list_host_images(host_id: str, refresh: bool = False, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, host_id)
     state = _host_cached_state(db, host, force_refresh=refresh)
-    return {"host_id": host_id, "images": state["images"], "cache": state["cache"], "cached_at": state["updated_at"]}
+    return {"host_id": host_id, "images": state["images"], "cache": state["cache"], "cached_at": state["updated_at"], "last_error": state.get("last_error"), "last_success_at": state.get("last_success_at")}
 
 
 @app.get("/api/v1/hosts/{host_id}/storage-pools")
 def list_storage_pools(host_id: str, refresh: bool = False, db: Session = Depends(get_db)) -> dict:
     host = _get_host_or_404(db, host_id)
     state = _host_cached_state(db, host, force_refresh=refresh)
-    return {"host_id": host_id, "storage_pools": state["pools"], "cache": state["cache"], "cached_at": state["updated_at"]}
+    return {"host_id": host_id, "storage_pools": state["pools"], "cache": state["cache"], "cached_at": state["updated_at"], "last_error": state.get("last_error"), "last_success_at": state.get("last_success_at")}
 
 
 @app.post("/api/v1/images")
-def create_image(payload: ImageCreateRequest, db: Session = Depends(get_db)) -> dict:
+def create_image(payload: ImageCreateRequest, request: Request, db: Session = Depends(get_db)) -> dict:
+    _require_roles(request, {"admin", "operator"})
     _enforce_policies("image.create", host_id=payload.host_id)
     host = _get_host_or_404(db, payload.host_id)
-    url = f"{_agent_base_url(host)}/agent/images"
-    try:
-        response = requests.post(
-            url,
-            json={"name": payload.name, "source_url": payload.source_url},
-            timeout=AGENT_TIMEOUT_S,
-        )
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"agent request failed: {exc}") from exc
-
+    image = _libvirt_call(host, "create_image", payload.name, payload.source_url or "default", 20)
+    _refresh_host_cache(db, host)
     _record_event("image.created", f"image {payload.name} created on host {payload.host_id}")
-    return {"host_id": payload.host_id, "image": response.json()}
+    _create_completed_task("image.create", payload.name, f"pool={payload.source_url or 'default'}")
+    return {"host_id": payload.host_id, "image": image}
 
 
 @app.delete("/api/v1/images/{image_id}")
-def delete_image(image_id: str, host_id: str, db: Session = Depends(get_db)) -> dict:
+def delete_image(image_id: str, host_id: str, request: Request, db: Session = Depends(get_db)) -> dict:
+    _require_roles(request, {"admin", "operator"})
     host = _get_host_or_404(db, host_id)
-    url = f"{_agent_base_url(host)}/agent/images/{image_id}"
-    try:
-        response = requests.delete(url, timeout=AGENT_TIMEOUT_S)
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"agent request failed: {exc}") from exc
-
+    result = _libvirt_call(host, "delete_image", image_id)
+    _refresh_host_cache(db, host)
     _record_event("image.deleted", f"image {image_id} deleted from host {host_id}")
-    return {"host_id": host_id, "result": response.json()}
+    return {"host_id": host_id, "result": result}
 
 
 @app.post("/api/v1/projects", response_model=ProjectRecord)
@@ -838,7 +824,6 @@ def dashboard_diagnostics(db: Session = Depends(get_db)) -> dict:
         "ui_routes": _dashboard_route_hints(),
         "host_count": len(hosts),
         "ready_hosts": len([host for host in hosts if host.status in {"ready", "registered"}]),
-        "project_count": len(PROJECTS),
         "policy_count": len(POLICIES),
         "event_count": len(EVENTS),
         "task_count": len(TASKS),
@@ -961,6 +946,9 @@ def create_runbook_schedule(runbook_name: str, cron: str, host_id: str | None = 
     return schedule
 
 
+
+app.include_router(build_vmware_router(_get_host_or_404, _libvirt_call, _refresh_host_cache))
+
 @app.get("/api/v1/routes")
 def list_routes() -> dict:
     routes = sorted(
@@ -973,22 +961,39 @@ def list_routes() -> dict:
     return {"count": len(routes), "routes": routes, "dashboard_hints": _dashboard_route_hints(), "base_path": BASE_PATH or "/"}
 
 
+@app.get("/api/v1/rbac/roles")
+def rbac_roles() -> dict:
+    return {
+        "roles": {
+            "admin": ["*"] ,
+            "operator": ["vm.*", "network.*", "image.*", "console.*", "task.retry"],
+            "viewer": ["read.*"],
+        },
+        "header": "x-role",
+    }
+
+
 @app.get("/api/v1/capabilities")
 def capabilities() -> dict:
     return {
         "platform": "kvm-dashboard",
-        "mode": "openshift-inspired",
+        "mode": "libvirt-live-proxmox-style",
         "features": {
             "host_lifecycle": True,
             "vm_lifecycle": True,
             "network_operations": True,
             "image_lifecycle": True,
-            "projects_quotas": True,
             "runbooks_tasks_events": True,
             "policies": True,
-            "console_ticket_placeholder": True,
+            "console_ticket_placeholder": False,
             "multi_page_dashboard": True,
             "phase6_execution_backend_foundation": True,
+            "vm_create_libvirt_live": True,
+            "vm_attachments_libvirt_live": True,
+            "console_libvirt_display_discovery": True,
+            "network_crud_libvirt_live": True,
+            "image_crud_libvirt_live": True,
+            "rbac_header_enforcement": True,
             "phase7_timeline_and_retry": True,
             "phase8_policy_enforcement_foundation": True,
         },
@@ -1074,6 +1079,20 @@ def list_events(limit: int = 50, event_type: str | None = None, since: str | Non
     return events[: min(limit, 200)]
 
 
+@app.get("/api/v1/operations-guide")
+def operations_guide() -> dict:
+    return {
+        "summary": "Live libvirt + PostgreSQL cache workflow. No host-agent dependency.",
+        "sections": [
+            {"title": "1) Register host", "steps": ["Go to Overview and verify host appears in Live host status", "Ensure libvirt URI is reachable and health is green"]},
+            {"title": "2) VM lifecycle", "steps": ["Open Virtual Machines page", "Use Provision / Import section for creation", "Use action buttons for start/stop/reboot/pause/resume/delete"]},
+            {"title": "3) Networks and storage", "steps": ["Use Networks page for create/delete/attach/detach", "Use Storage and Images pages to inspect pools, qcow2 volumes, and used-by tags"]},
+            {"title": "4) Console", "steps": ["Open Console page or VM row console action", "noVNC URL is generated from libvirt display + configured NOVNC paths"]},
+            {"title": "5) Events and tasks", "steps": ["Use Events page to audit operation timeline", "Use Tasks page for operation records and retries"]},
+        ],
+    }
+
+
 @app.get("/api/v1/overview")
 def overview(db: Session = Depends(get_db)) -> dict:
     hosts = db.query(Host).all()
@@ -1107,17 +1126,33 @@ def overview(db: Session = Depends(get_db)) -> dict:
 @app.get("/api/v1/vms/{vm_id}/console", response_model=ConsoleTicketResponse)
 def vm_console(vm_id: str, host_id: str, db: Session = Depends(get_db)) -> ConsoleTicketResponse:
     host = _get_host_or_404(db, host_id)
-    ticket = str(uuid4())
-    ws_url = f"{NOVNC_WS_BASE}?{urlencode({'host_id': host_id, 'vm_id': vm_id, 'ticket': ticket})}"
-    viewer_query = urlencode({
-        "host_id": host_id,
-        "vm_id": vm_id,
-        "ticket": ticket,
-        "path": ws_url,
-        "autoconnect": 1,
-        "resize": "remote",
-    })
-    novnc_url = f"{NOVNC_BASE_URL}?{viewer_query}"
+
+    now_ts = time.time()
+    for item in CONSOLE_SESSIONS:
+        if item.get("host_id") != host_id or item.get("vm_id") != vm_id:
+            continue
+        created = item.get("created_at", "")
+        try:
+            created_ts = datetime.fromisoformat(created.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            created_ts = 0.0
+        if (now_ts - created_ts) <= CONSOLE_SESSION_TTL_S and item.get("novnc_url"):
+            return ConsoleTicketResponse(
+                host_id=host_id,
+                vm_id=vm_id,
+                ticket=item.get("ticket", ""),
+                noVNC_url=item.get("novnc_url", ""),
+            )
+
+    console = _libvirt_call(host, "console_info", vm_id)
+    ticket, novnc_url, console_meta = build_console_urls(
+        novnc_base_url=NOVNC_BASE_URL,
+        novnc_ws_base=NOVNC_WS_BASE,
+        host_id=host_id,
+        vm_id=vm_id,
+        host_address=host.address,
+        display_uri=str(console.get("display_uri") or ""),
+    )
 
     session = {
         "session_id": str(uuid4()),
@@ -1125,9 +1160,13 @@ def vm_console(vm_id: str, host_id: str, db: Session = Depends(get_db)) -> Conso
         "vm_id": vm_id,
         "ticket": ticket,
         "novnc_url": novnc_url,
+        "display_uri": console.get("display_uri"),
+        "vnc_host": console_meta.get("vnc_host", ""),
+        "vnc_port": console_meta.get("vnc_port", ""),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     CONSOLE_SESSIONS.insert(0, session)
+    del CONSOLE_SESSIONS[200:]
     _record_event("vm.console.ticket", f"console ticket requested for vm {vm_id} on host {host_id}")
     return ConsoleTicketResponse(
         host_id=host_id,
@@ -1228,15 +1267,21 @@ def get_task(task_id: str) -> TaskRecord:
 
 
 @app.get("/api/v1/live/status")
-def live_status(db: Session = Depends(get_db)) -> dict:
+def live_status(refresh: bool = False, db: Session = Depends(get_db)) -> dict:
+    now_ts = datetime.now(timezone.utc).timestamp()
+    cached = LIVE_STATUS_CACHE.get("payload")
+    cached_at = float(LIVE_STATUS_CACHE.get("updated_at", 0.0) or 0.0)
+    if not refresh and cached and (now_ts - cached_at) <= LIVE_STATUS_TTL_S:
+        return cached
+
     hosts = db.query(Host).all()
     items: list[dict[str, Any]] = []
     for host in hosts:
-        agent_ok = False
+        libvirt_ok = False
         detail = "unreachable"
         try:
             status = _libvirt_call(host, "health")
-            agent_ok = bool(status.get("reachable"))
+            libvirt_ok = bool(status.get("reachable"))
             detail = "libvirt-direct"
         except HTTPException:
             pass
@@ -1245,12 +1290,15 @@ def live_status(db: Session = Depends(get_db)) -> dict:
                 "host_id": host.host_id,
                 "address": host.address,
                 "status": host.status,
-                "agent_reachable": agent_ok,
+                "libvirt_reachable": libvirt_ok,
                 "execution": detail,
                 "libvirt_uri": host.libvirt_uri,
             }
         )
-    return {"count": len(items), "items": items, "timestamp": datetime.now(timezone.utc).isoformat()}
+    payload = {"count": len(items), "items": items, "timestamp": datetime.now(timezone.utc).isoformat(), "cache_ttl_s": LIVE_STATUS_TTL_S}
+    LIVE_STATUS_CACHE["updated_at"] = now_ts
+    LIVE_STATUS_CACHE["payload"] = payload
+    return payload
 
 @app.get("/api/v1/console/novnc/status")
 def novnc_status() -> dict:
@@ -1334,19 +1382,41 @@ def list_image_deployments(limit: int = 50) -> dict:
 
 
 @app.get("/{path:path}", include_in_schema=False, response_class=HTMLResponse)
-def dashboard_fallback(path: str, db: Session = Depends(get_db)) -> HTMLResponse:
+def dashboard_fallback(path: str, request: Request, db: Session = Depends(get_db)) -> HTMLResponse:
     if _is_api_or_reserved_path(path):
         raise HTTPException(status_code=404, detail="page not found")
-    return HTMLResponse(dashboard_home(db))
+    try:
+        require_ui_auth(request, db)
+    except HTTPException:
+        return RedirectResponse(url="/login", status_code=303)
+    return HTMLResponse(_render_ui_page("dashboard", db))
 
 
 @app.exception_handler(404)
-def not_found_handler(request: Request, exc: HTTPException) -> JSONResponse:
+def not_found_handler(request: Request, exc: HTTPException):
+    path = str(request.url.path)
+    accept = request.headers.get("accept", "")
+    if "text/html" in accept and not _is_api_or_reserved_path(path):
+        db_gen = get_db()
+        try:
+            db = next(db_gen)
+            try:
+                require_ui_auth(request, db)
+            except HTTPException:
+                return RedirectResponse(url="/login", status_code=303)
+            return HTMLResponse(_render_ui_page("dashboard", db), status_code=200)
+        except Exception:
+            pass
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
     return JSONResponse(
         status_code=404,
         content={
             "detail": exc.detail if isinstance(exc.detail, str) else "page not found",
-            "path": str(request.url.path),
+            "path": path,
             "suggestions": _dashboard_route_hints(),
             "routes_api": _with_base("/api/v1/routes"),
         },

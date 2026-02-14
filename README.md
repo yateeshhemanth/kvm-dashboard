@@ -6,6 +6,9 @@ This repository now contains a **working starter implementation** of:
 
 The goal is to give you a clean base to build a full OpenShift-inspired operations platform (VM lifecycle, network operations, noVNC, qcow2 image lifecycle, policy, and day-2 automation).
 
+> **Current mode:** Dashboard operates in direct libvirt-live mode with PostgreSQL cache.
+> Host-agent mock execution paths are deprecated and should not be used for VM/network/image operations.
+
 ---
 
 ## What is included now
@@ -94,6 +97,19 @@ curl http://localhost:9090/agent/status
 
 Visit: `http://localhost:8000/`
 
+
+### 3.1) Login credentials (Dashboard UI)
+
+Dashboard UI now uses DB-backed login. Default credentials:
+
+- Username: `admin`
+- Password: `admin123`
+
+Override via environment variables:
+
+- `DASHBOARD_ADMIN_USER`
+- `DASHBOARD_ADMIN_PASSWORD`
+
 ### 4) Validate dashboard health
 
 ```bash
@@ -105,6 +121,16 @@ Expected output:
 ```json
 {"status":"ok"}
 ```
+
+
+### Console connectivity note (important)
+
+The dashboard only generates console tickets/URLs. For **live noVNC consoles** you must run a reachable noVNC + websockify endpoint and set:
+
+- `NOVNC_BASE_URL` (viewer URL, example: `https://novnc.example.com/vnc.html`)
+- `NOVNC_WS_BASE` (websockify URL/path, example: `wss://novnc.example.com/websockify`)
+
+If libvirt reports display host as `127.0.0.1`, dashboard automatically rewrites it to the registered host address when building the console URL metadata.
 
 ### 5) See registered hosts
 
@@ -240,7 +266,7 @@ curl -X POST http://127.0.0.1:9090/agent/push-now
 - `POST /api/v1/runbooks/{runbook_name}/execute`
 - `GET /api/v1/tasks`
 - `GET /api/v1/tasks/{task_id}`
-- `GET /api/v1/hosts/{host_id}/agent-health`
+- `GET /api/v1/hosts/{host_id}/libvirt-health`
 - `GET /api/v1/backbone/check`
 
 ## Next phase delivered in this commit
@@ -692,7 +718,14 @@ export NOVNC_WS_BASE=wss://novnc.example.com/websockify
 
 To reduce repeated `virsh` process spawning and PID pressure on hosts/containers, dashboard now caches per-host VM/network/image/storage snapshots in PostgreSQL table `host_libvirt_cache`.
 
-- Cache TTL env: `LIBVIRT_CACHE_TTL_S` (default: `15`)
+- Cache TTL env: `LIBVIRT_CACHE_TTL_S` (default: `60`)
+- Live status cache TTL env: `LIVE_STATUS_TTL_S` (default: `15`)
+- Virsh command timeout env: `LIBVIRT_CMD_TIMEOUT_S` (default: `8`)
+- Console ticket reuse TTL env: `CONSOLE_SESSION_TTL_S` (default: `30`)
+- Max concurrent virsh commands env: `LIBVIRT_MAX_CONCURRENCY` (default: `2`)
+- Fork retry tuning envs: `LIBVIRT_FORK_RETRY_COUNT` (default: `2`), `LIBVIRT_FORK_RETRY_SLEEP_S` (default: `0.25`)
+- Default pool for plain image names in VM create: `LIBVIRT_DEFAULT_POOL` (default: `default`)
+- Host register now accepts optional `tags` and `project_id` (and `/api/v1/hosts` supports filtering via `?project_id=` and `?tag=`).
 - Endpoints support `?refresh=true` to force recrawl from libvirt.
 
 This improves UI responsiveness while keeping operations functional (power, resize, snapshots, console ticket, etc.).
@@ -700,3 +733,10 @@ This improves UI responsiveness while keeping operations functional (power, resi
 
 ### Direct architecture
 Dashboard (10.110.17.160) connects directly to registered hosts using each host `libvirt_uri` such as `qemu+ssh://root@10.110.17.153/system`. No host-agent process is required on `.153` for core operations. Multiple hosts are supported by adding multiple host records.
+
+
+## Operations guide page
+
+- UI route: `/guide`
+- API source: `GET /api/v1/operations-guide`
+- Contains step-by-step usage for host registration, VM lifecycle, network/storage/image, console, events, and tasks.
