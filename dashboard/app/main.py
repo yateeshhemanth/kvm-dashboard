@@ -1,13 +1,11 @@
 from datetime import datetime, timezone
 import os
-import time
 from typing import Any
 from uuid import uuid4
 from urllib.parse import urlencode
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from .db import get_db, init_db
