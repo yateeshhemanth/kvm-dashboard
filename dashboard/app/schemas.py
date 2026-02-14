@@ -44,6 +44,7 @@ class VMProvisionRequest(BaseModel):
     cpu_cores: int
     memory_mb: int
     image: str
+    network: str = "default"
 
 
 class VMHostActionRequest(BaseModel):
