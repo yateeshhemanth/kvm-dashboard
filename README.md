@@ -94,6 +94,19 @@ curl http://localhost:9090/agent/status
 
 Visit: `http://localhost:8000/`
 
+
+### 3.1) Login credentials (Dashboard UI)
+
+Dashboard UI now uses DB-backed login. Default credentials:
+
+- Username: `admin`
+- Password: `admin123`
+
+Override via environment variables:
+
+- `DASHBOARD_ADMIN_USER`
+- `DASHBOARD_ADMIN_PASSWORD`
+
 ### 4) Validate dashboard health
 
 ```bash
@@ -105,6 +118,16 @@ Expected output:
 ```json
 {"status":"ok"}
 ```
+
+
+### Console connectivity note (important)
+
+The dashboard only generates console tickets/URLs. For **live noVNC consoles** you must run a reachable noVNC + websockify endpoint and set:
+
+- `NOVNC_BASE_URL` (viewer URL, example: `https://novnc.example.com/vnc.html`)
+- `NOVNC_WS_BASE` (websockify URL/path, example: `wss://novnc.example.com/websockify`)
+
+If libvirt reports display host as `127.0.0.1`, dashboard automatically rewrites it to the registered host address when building the console URL metadata.
 
 ### 5) See registered hosts
 
@@ -692,7 +715,12 @@ export NOVNC_WS_BASE=wss://novnc.example.com/websockify
 
 To reduce repeated `virsh` process spawning and PID pressure on hosts/containers, dashboard now caches per-host VM/network/image/storage snapshots in PostgreSQL table `host_libvirt_cache`.
 
-- Cache TTL env: `LIBVIRT_CACHE_TTL_S` (default: `15`)
+- Cache TTL env: `LIBVIRT_CACHE_TTL_S` (default: `60`)
+- Live status cache TTL env: `LIVE_STATUS_TTL_S` (default: `15`)
+- Virsh command timeout env: `LIBVIRT_CMD_TIMEOUT_S` (default: `8`)
+- Console ticket reuse TTL env: `CONSOLE_SESSION_TTL_S` (default: `30`)
+- Max concurrent virsh commands env: `LIBVIRT_MAX_CONCURRENCY` (default: `2`)
+- Fork retry tuning envs: `LIBVIRT_FORK_RETRY_COUNT` (default: `2`), `LIBVIRT_FORK_RETRY_SLEEP_S` (default: `0.25`)
 - Endpoints support `?refresh=true` to force recrawl from libvirt.
 
 This improves UI responsiveness while keeping operations functional (power, resize, snapshots, console ticket, etc.).

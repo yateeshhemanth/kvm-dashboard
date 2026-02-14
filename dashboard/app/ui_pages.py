@@ -32,7 +32,6 @@ def render_dashboard_page(
     *,
     base_path: str,
     stats: dict[str, Any],
-    diagnostics: list[tuple[str, str]],
 ) -> str:
     page_key = page if page in PAGE_CONFIG else "dashboard"
     config = PAGE_CONFIG[page_key]
@@ -45,7 +44,6 @@ def render_dashboard_page(
         )
         nav_html += f"<div class='nav-group'><div class='nav-title'>{group}</div>{links}</div>"
 
-    diagnostics_html = "".join(f"<li><strong>{label}:</strong> {value}</li>" for label, value in diagnostics)
 
     return f"""
     <!doctype html>
@@ -85,6 +83,11 @@ def render_dashboard_page(
           .pill.stopped {{ background: rgba(122,130,148,.2); color:#b6c0d4; }}
           .pill.paused {{ background: rgba(245,165,36,.2); color:#ffd277; }}
           .error {{ color:#ff9cbc; }}
+          .console-modal {{ position:fixed; inset:0; background:rgba(4,9,20,.75); display:none; align-items:center; justify-content:center; z-index:9999; }}
+          .console-modal.open {{ display:flex; }}
+          .console-shell {{ width:min(1200px,96vw); height:min(780px,92vh); background:#0d1526; border:1px solid #38507a; border-radius:10px; overflow:hidden; display:flex; flex-direction:column; }}
+          .console-head {{ display:flex; justify-content:space-between; align-items:center; padding:8px 10px; border-bottom:1px solid #263b61; background:#111c33; }}
+          .console-frame {{ width:100%; height:100%; border:0; background:#000; }}
         </style>
       </head>
       <body>
@@ -109,10 +112,23 @@ def render_dashboard_page(
             </div>
             <div class='card' id='actions'></div>
             <div class='card' style='margin-top:12px' id='content'></div>
-            <div class='card' style='margin-top:12px'><strong>Platform Status</strong><ul>{diagnostics_html}</ul></div>
             </div>
           </main>
         </div>
+
+        <div id='consoleModal' class='console-modal'>
+          <div class='console-shell'>
+            <div class='console-head'>
+              <strong id='consoleTitle'>VM Console</strong>
+              <div class='row' style='margin:0'>
+                <button class='btn' id='consolePopoutBtn'>Pop out</button>
+                <button class='btn danger' id='consoleCloseBtn'>Close</button>
+              </div>
+            </div>
+            <iframe id='consoleFrame' class='console-frame' loading='eager' referrerpolicy='no-referrer'></iframe>
+          </div>
+        </div>
+
         <script>
           const key = {page_key!r};
           const base = {base_path!r};
@@ -120,15 +136,46 @@ def render_dashboard_page(
           const actions = document.getElementById('actions');
           const searchInput = document.getElementById('search');
           let currentRows = [];
+          let consoleLastUrl = '';
+
+          window.showConsole = function showConsole(url, title='VM Console') {{
+            const modal = document.getElementById('consoleModal');
+            const frame = document.getElementById('consoleFrame');
+            const titleEl = document.getElementById('consoleTitle');
+            if (!modal || !frame || !titleEl) return;
+            titleEl.textContent = title;
+            if (consoleLastUrl !== url) {{
+              frame.src = url;
+              consoleLastUrl = url;
+            }}
+            modal.classList.add('open');
+          }}
+
+          function closeConsole() {{
+            const modal = document.getElementById('consoleModal');
+            const frame = document.getElementById('consoleFrame');
+            if (!modal || !frame) return;
+            modal.classList.remove('open');
+            frame.src = 'about:blank';
+            consoleLastUrl = '';
+          }}
 
           async function api(path, method='GET', body=null) {{
             const resp = await fetch((base || '') + path, {{
               method,
+              credentials: 'same-origin',
               headers: {{ 'Content-Type': 'application/json' }},
               body: body ? JSON.stringify(body) : null,
             }});
-            const data = await resp.json();
-            if (!resp.ok) throw new Error(data.detail || 'Request failed');
+            const ctype = resp.headers.get('content-type') || '';
+            const isJson = ctype.includes('application/json');
+            const data = isJson ? await resp.json() : await resp.text();
+            if (!resp.ok) {{
+              if (!isJson && typeof data === 'string' && data.toLowerCase().includes('<!doctype html')) {{
+                throw new Error('Session expired. Please login again.');
+              }}
+              throw new Error((isJson && data?.detail) || 'Request failed');
+            }}
             return data;
           }}
 
@@ -426,7 +473,7 @@ Recovery ISO: ${{vm.annotations?.['recovery.iso'] || 'not attached'}}`);
           window.openConsole = async (vmId, hostId) => {{
             try {{
               const c = await api(`/api/v1/vms/${{vmId}}/console?host_id=${{encodeURIComponent(hostId)}}`);
-              window.open(c.noVNC_url, '_blank');
+              showConsole(c.noVNC_url, `Console · ${{vmId}}@${{hostId}}`);
             }} catch (e) {{ setError(e); }}
           }};
 
@@ -501,14 +548,20 @@ Recovery ISO: ${{vm.annotations?.['recovery.iso'] || 'not attached'}}`);
             actions.innerHTML = `<strong>Console options</strong><div class='row'>${{renderHostSelector(hosts, hostId, 'consoleHostSelect')}}</div><div class='muted'>Use the VMs page “Console” action or request here manually.</div><div class='row'><input id='conVm' placeholder='vm id'/><button class='btn' id='conBtn'>Create console ticket</button></div>`;
             const sess = await api('/api/v1/console/sessions');
             const novnc = await api('/api/v1/console/novnc/status');
-            const rows = (sess.items || []).map(s => [s.session_id, s.host_id, s.vm_id, s.created_at]);
-            rows.unshift(['noVNC base', '-', novnc.novnc_base_url, `ws:${{novnc.novnc_ws_base}}`]);
-            content.innerHTML = `<strong>Console sessions + noVNC status</strong>${{table(['Session','Host','VM','Created/Path'], rows)}}`;
+            const rows = (sess.items || []).map(s => [
+              s.session_id,
+              s.host_id,
+              s.vm_id,
+              s.created_at,
+              `<button class='btn' onclick="showConsole('${{(s.novnc_url || '').replace(/'/g, "\\'")}}','Console · ${{s.vm_id}}@${{s.host_id}}')">Open</button>`
+            ]);
+            rows.unshift(['noVNC base', '-', novnc.novnc_base_url, `ws:${{novnc.novnc_ws_base}}`, '-']);
+            content.innerHTML = `<strong>Console sessions + noVNC status</strong>${{table(['Session','Host','VM','Created/Path','Action'], rows)}}`;
             document.getElementById('conBtn').onclick = async () => {{
               if (!hostId) return;
               const vmId = document.getElementById('conVm').value;
               const t = await api(`/api/v1/vms/${{vmId}}/console?host_id=${{encodeURIComponent(hostId)}}`);
-              window.open(t.noVNC_url, '_blank');
+              showConsole(t.noVNC_url, `Console · ${{vmId}}@${{hostId}}`);
             }};
             bindSearch();
             bindHostSelector('consoleHostSelect', loadConsole);
@@ -633,7 +686,7 @@ Recovery ISO: ${{vm.annotations?.['recovery.iso'] || 'not attached'}}`);
               return;
             }}
             if (refreshTimer) clearInterval(refreshTimer);
-            const intervalMs = key === 'tasks' ? 5000 : 10000;
+            const intervalMs = key === 'tasks' ? 5000 : (key === 'console' ? 20000 : 10000);
             refreshTimer = setInterval(async () => {{
               try {{
                 if (document.hidden) return;
@@ -645,6 +698,12 @@ Recovery ISO: ${{vm.annotations?.['recovery.iso'] || 'not attached'}}`);
           }}
 
           async function boot() {{
+            const closeBtn = document.getElementById('consoleCloseBtn');
+            const popBtn = document.getElementById('consolePopoutBtn');
+            const modal = document.getElementById('consoleModal');
+            if (closeBtn) closeBtn.onclick = closeConsole;
+            if (modal) modal.onclick = (e) => {{ if (e.target === modal) closeConsole(); }};
+            if (popBtn) popBtn.onclick = () => {{ if (consoleLastUrl) window.open(consoleLastUrl, '_blank'); }};
             try {{
               await refreshPage();
               startAutoRefresh();
