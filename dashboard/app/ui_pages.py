@@ -32,7 +32,6 @@ def render_dashboard_page(
     *,
     base_path: str,
     stats: dict[str, Any],
-    diagnostics: list[tuple[str, str]],
 ) -> str:
     page_key = page if page in PAGE_CONFIG else "dashboard"
     config = PAGE_CONFIG[page_key]
@@ -45,7 +44,6 @@ def render_dashboard_page(
         )
         nav_html += f"<div class='nav-group'><div class='nav-title'>{group}</div>{links}</div>"
 
-    diagnostics_html = "".join(f"<li><strong>{label}:</strong> {value}</li>" for label, value in diagnostics)
 
     return f"""
     <!doctype html>
@@ -77,6 +75,9 @@ def render_dashboard_page(
           .btn.danger {{ border-color:#7e294f; background:#57243d; }}
           .btn.warn {{ border-color:#8c5e1c; background:#6b4a1d; }}
           .row {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }}
+          .op-grid {{ display:grid; gap:10px; grid-template-columns: repeat(auto-fit,minmax(330px,1fr)); margin-top:8px; }}
+          .op-card {{ border:1px solid #334a72; background:#1a2740; border-radius:8px; padding:10px; }}
+          .op-card h4 {{ margin:0 0 8px; font-size:13px; color:#dbe7ff; }}
           input, select {{ background:#0f1a3b; border:1px solid #2a447f; color:#dce7ff; border-radius:8px; padding:7px 9px; }}
           table {{ width:100%; border-collapse:collapse; margin-top:8px; }}
           th, td {{ border-bottom:1px solid #22325c; padding:8px; text-align:left; font-size:13px; }}
@@ -85,6 +86,11 @@ def render_dashboard_page(
           .pill.stopped {{ background: rgba(122,130,148,.2); color:#b6c0d4; }}
           .pill.paused {{ background: rgba(245,165,36,.2); color:#ffd277; }}
           .error {{ color:#ff9cbc; }}
+          .console-modal {{ position:fixed; inset:0; background:rgba(4,9,20,.75); display:none; align-items:center; justify-content:center; z-index:9999; }}
+          .console-modal.open {{ display:flex; }}
+          .console-shell {{ width:min(1200px,96vw); height:min(780px,92vh); background:#0d1526; border:1px solid #38507a; border-radius:10px; overflow:hidden; display:flex; flex-direction:column; }}
+          .console-head {{ display:flex; justify-content:space-between; align-items:center; padding:8px 10px; border-bottom:1px solid #263b61; background:#111c33; }}
+          .console-frame {{ width:100%; height:100%; border:0; background:#000; }}
         </style>
       </head>
       <body>
@@ -109,10 +115,23 @@ def render_dashboard_page(
             </div>
             <div class='card' id='actions'></div>
             <div class='card' style='margin-top:12px' id='content'></div>
-            <div class='card' style='margin-top:12px'><strong>Platform Status</strong><ul>{diagnostics_html}</ul></div>
             </div>
           </main>
         </div>
+
+        <div id='consoleModal' class='console-modal'>
+          <div class='console-shell'>
+            <div class='console-head'>
+              <strong id='consoleTitle'>VM Console</strong>
+              <div class='row' style='margin:0'>
+                <button class='btn' id='consolePopoutBtn'>Pop out</button>
+                <button class='btn danger' id='consoleCloseBtn'>Close</button>
+              </div>
+            </div>
+            <iframe id='consoleFrame' class='console-frame' loading='eager' referrerpolicy='no-referrer'></iframe>
+          </div>
+        </div>
+
         <script>
           const key = {page_key!r};
           const base = {base_path!r};
@@ -120,15 +139,46 @@ def render_dashboard_page(
           const actions = document.getElementById('actions');
           const searchInput = document.getElementById('search');
           let currentRows = [];
+          let consoleLastUrl = '';
+
+          window.showConsole = function showConsole(url, title='VM Console') {{
+            const modal = document.getElementById('consoleModal');
+            const frame = document.getElementById('consoleFrame');
+            const titleEl = document.getElementById('consoleTitle');
+            if (!modal || !frame || !titleEl) return;
+            titleEl.textContent = title;
+            if (consoleLastUrl !== url) {{
+              frame.src = url;
+              consoleLastUrl = url;
+            }}
+            modal.classList.add('open');
+          }}
+
+          function closeConsole() {{
+            const modal = document.getElementById('consoleModal');
+            const frame = document.getElementById('consoleFrame');
+            if (!modal || !frame) return;
+            modal.classList.remove('open');
+            frame.src = 'about:blank';
+            consoleLastUrl = '';
+          }}
 
           async function api(path, method='GET', body=null) {{
             const resp = await fetch((base || '') + path, {{
               method,
+              credentials: 'same-origin',
               headers: {{ 'Content-Type': 'application/json' }},
               body: body ? JSON.stringify(body) : null,
             }});
-            const data = await resp.json();
-            if (!resp.ok) throw new Error(data.detail || 'Request failed');
+            const ctype = resp.headers.get('content-type') || '';
+            const isJson = ctype.includes('application/json');
+            const data = isJson ? await resp.json() : await resp.text();
+            if (!resp.ok) {{
+              if (!isJson && typeof data === 'string' && data.toLowerCase().includes('<!doctype html')) {{
+                throw new Error('Session expired. Please login again.');
+              }}
+              throw new Error((isJson && data?.detail) || 'Request failed');
+            }}
             return data;
           }}
 
@@ -207,45 +257,56 @@ def render_dashboard_page(
             const {{ hosts, hostId }} = await pickSelectedHostId();
             actions.innerHTML = `<strong>VM operations</strong>
               <div class='row'>${{renderHostSelector(hosts, hostId, 'vmHostSelect')}}</div>
-              <div class='row'>
-                <input id='vmName' placeholder='VM name' />
-                <input id='vmCpu' type='number' value='2' min='1' style='width:80px' />
-                <input id='vmMem' type='number' value='2048' min='512' style='width:100px' />
-                <input id='vmImage' placeholder='base.qcow2' value='base.qcow2' />
-                <button class='btn' id='createVmBtn'>Create VM</button>
-              </div>
-              <div class='row'>
-                <input id='impVmId' placeholder='Import VM ID' />
-                <input id='impVmName' placeholder='Import VM name' />
-                <button class='btn' id='importVmBtn'>Import VM</button>
-              </div>
-              <div class='row'>
-                <input id='opVmId' placeholder='Target VM ID for day-2 ops' style='min-width:220px' />
-                <input id='opCpu' type='number' value='4' min='1' style='width:80px' />
-                <input id='opMem' type='number' value='4096' min='512' style='width:100px' />
-                <button class='btn' id='resizeVmBtn'>Resize CPU/Memory</button>
-                <input id='cloneName' placeholder='clone name' />
-                <button class='btn' id='cloneVmBtn'>Clone VM</button>
-              </div>
-              <div class='row'>
-                <input id='snapName' placeholder='snapshot name' value='pre-maintenance' />
-                <button class='btn' id='snapshotBtn'>Create Snapshot</button>
-                <input id='migHost' placeholder='target host id' />
-                <button class='btn' id='migrateBtn'>Migrate</button>
-                <button class='btn danger' id='deleteVmBtn'>Delete VM</button>
-              </div>
-              <div class='row'>
-                <input id='netId' placeholder='network id for attach/detach' style='min-width:220px' />
-                <button class='btn' id='attachNetBtn'>Attach Network</button>
-                <button class='btn warn' id='detachNetBtn'>Detach Network</button>
-                <input id='snapId' placeholder='snapshot id' style='min-width:180px' />
-                <button class='btn' id='revertSnapBtn'>Revert Snapshot</button>
-                <button class='btn danger' id='deleteSnapBtn'>Delete Snapshot</button>
-              </div>
-              <div class='row'>
-                <input id='isoPath' placeholder='/var/lib/libvirt/images/recovery.iso' style='min-width:320px' />
-                <button class='btn warn' id='attachIsoBtn'>Attach Recovery ISO</button>
-                <button class='btn' id='detachIsoBtn'>Detach Recovery ISO</button>
+              <div class='op-grid'>
+                <div class='op-card'>
+                  <h4>Provision / Import</h4>
+                  <div class='row'>
+                    <input id='vmName' placeholder='VM name' />
+                    <input id='vmCpu' type='number' value='2' min='1' style='width:80px' />
+                    <input id='vmMem' type='number' value='2048' min='512' style='width:100px' />
+                    <input id='vmImage' placeholder='base.qcow2 or pool::volume' value='base.qcow2' />
+                    <button class='btn' id='createVmBtn'>Create VM</button>
+                  </div>
+                  <div class='row'>
+                    <input id='impVmId' placeholder='Import VM ID' />
+                    <input id='impVmName' placeholder='Import VM name' />
+                    <button class='btn' id='importVmBtn'>Import VM</button>
+                  </div>
+                </div>
+                <div class='op-card'>
+                  <h4>Day-2 Compute</h4>
+                  <div class='row'>
+                    <input id='opVmId' placeholder='Target VM ID for day-2 ops' style='min-width:220px' />
+                    <input id='opCpu' type='number' value='4' min='1' style='width:80px' />
+                    <input id='opMem' type='number' value='4096' min='512' style='width:100px' />
+                    <button class='btn' id='resizeVmBtn'>Resize CPU/Memory</button>
+                    <input id='cloneName' placeholder='clone name' />
+                    <button class='btn' id='cloneVmBtn'>Clone VM</button>
+                  </div>
+                  <div class='row'>
+                    <input id='snapName' placeholder='snapshot name' value='pre-maintenance' />
+                    <button class='btn' id='snapshotBtn'>Create Snapshot</button>
+                    <input id='migHost' placeholder='target host id' />
+                    <button class='btn' id='migrateBtn'>Migrate</button>
+                    <button class='btn danger' id='deleteVmBtn'>Delete VM</button>
+                  </div>
+                </div>
+                <div class='op-card'>
+                  <h4>Network / Snapshot / Recovery ISO</h4>
+                  <div class='row'>
+                    <input id='netId' placeholder='network id for attach/detach' style='min-width:220px' />
+                    <button class='btn' id='attachNetBtn'>Attach Network</button>
+                    <button class='btn warn' id='detachNetBtn'>Detach Network</button>
+                    <input id='snapId' placeholder='snapshot id' style='min-width:180px' />
+                    <button class='btn' id='revertSnapBtn'>Revert Snapshot</button>
+                    <button class='btn danger' id='deleteSnapBtn'>Delete Snapshot</button>
+                  </div>
+                  <div class='row'>
+                    <input id='isoPath' placeholder='/var/lib/libvirt/images/recovery.iso' style='min-width:320px' />
+                    <button class='btn warn' id='attachIsoBtn'>Attach Recovery ISO</button>
+                    <button class='btn' id='detachIsoBtn'>Detach Recovery ISO</button>
+                  </div>
+                </div>
               </div>
               <div class='muted'>Live day-2 operations: power, resize, clone, migrate, snapshots (create/revert/delete), network attach/detach, delete, console, and recovery ISO workflows.</div>`;
             if (!hostId) {{
@@ -426,7 +487,7 @@ Recovery ISO: ${{vm.annotations?.['recovery.iso'] || 'not attached'}}`);
           window.openConsole = async (vmId, hostId) => {{
             try {{
               const c = await api(`/api/v1/vms/${{vmId}}/console?host_id=${{encodeURIComponent(hostId)}}`);
-              window.open(c.noVNC_url, '_blank');
+              showConsole(c.noVNC_url, `Console · ${{vmId}}@${{hostId}}`);
             }} catch (e) {{ setError(e); }}
           }};
 
@@ -501,14 +562,20 @@ Recovery ISO: ${{vm.annotations?.['recovery.iso'] || 'not attached'}}`);
             actions.innerHTML = `<strong>Console options</strong><div class='row'>${{renderHostSelector(hosts, hostId, 'consoleHostSelect')}}</div><div class='muted'>Use the VMs page “Console” action or request here manually.</div><div class='row'><input id='conVm' placeholder='vm id'/><button class='btn' id='conBtn'>Create console ticket</button></div>`;
             const sess = await api('/api/v1/console/sessions');
             const novnc = await api('/api/v1/console/novnc/status');
-            const rows = (sess.items || []).map(s => [s.session_id, s.host_id, s.vm_id, s.created_at]);
-            rows.unshift(['noVNC base', '-', novnc.novnc_base_url, `ws:${{novnc.novnc_ws_base}}`]);
-            content.innerHTML = `<strong>Console sessions + noVNC status</strong>${{table(['Session','Host','VM','Created/Path'], rows)}}`;
+            const rows = (sess.items || []).map(s => [
+              s.session_id,
+              s.host_id,
+              s.vm_id,
+              s.created_at,
+              `<button class='btn' onclick="showConsole('${{(s.novnc_url || '').replace(/'/g, "\\'")}}','Console · ${{s.vm_id}}@${{s.host_id}}')">Open</button>`
+            ]);
+            rows.unshift(['noVNC base', '-', novnc.novnc_base_url, `ws:${{novnc.novnc_ws_base}}`, '-']);
+            content.innerHTML = `<strong>Console sessions + noVNC status</strong>${{table(['Session','Host','VM','Created/Path','Action'], rows)}}`;
             document.getElementById('conBtn').onclick = async () => {{
               if (!hostId) return;
               const vmId = document.getElementById('conVm').value;
               const t = await api(`/api/v1/vms/${{vmId}}/console?host_id=${{encodeURIComponent(hostId)}}`);
-              window.open(t.noVNC_url, '_blank');
+              showConsole(t.noVNC_url, `Console · ${{vmId}}@${{hostId}}`);
             }};
             bindSearch();
             bindHostSelector('consoleHostSelect', loadConsole);
@@ -633,7 +700,7 @@ Recovery ISO: ${{vm.annotations?.['recovery.iso'] || 'not attached'}}`);
               return;
             }}
             if (refreshTimer) clearInterval(refreshTimer);
-            const intervalMs = key === 'tasks' ? 5000 : 10000;
+            const intervalMs = key === 'tasks' ? 5000 : (key === 'console' ? 20000 : 10000);
             refreshTimer = setInterval(async () => {{
               try {{
                 if (document.hidden) return;
@@ -645,6 +712,12 @@ Recovery ISO: ${{vm.annotations?.['recovery.iso'] || 'not attached'}}`);
           }}
 
           async function boot() {{
+            const closeBtn = document.getElementById('consoleCloseBtn');
+            const popBtn = document.getElementById('consolePopoutBtn');
+            const modal = document.getElementById('consoleModal');
+            if (closeBtn) closeBtn.onclick = closeConsole;
+            if (modal) modal.onclick = (e) => {{ if (e.target === modal) closeConsole(); }};
+            if (popBtn) popBtn.onclick = () => {{ if (consoleLastUrl) window.open(consoleLastUrl, '_blank'); }};
             try {{
               await refreshPage();
               startAutoRefresh();

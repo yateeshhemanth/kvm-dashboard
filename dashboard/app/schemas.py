@@ -11,6 +11,8 @@ class HostRegisterRequest(BaseModel):
     cpu_cores: int = 0
     memory_mb: int = 0
     libvirt_uri: str = "qemu+ssh://root@10.110.17.153/system"
+    tags: list[str] = Field(default_factory=list)
+    project_id: str | None = None
 
 
 class HeartbeatRequest(BaseModel):
@@ -44,6 +46,7 @@ class VMProvisionRequest(BaseModel):
     cpu_cores: int
     memory_mb: int
     image: str
+    network: str = "default"
 
 
 class VMHostActionRequest(BaseModel):
@@ -220,6 +223,8 @@ class HostResponse(BaseModel):
     cpu_cores: int
     memory_mb: int
     libvirt_uri: str
+    tags: list[str] = Field(default_factory=list)
+    project_id: str | None = None
     last_heartbeat: datetime
 
     class Config:
