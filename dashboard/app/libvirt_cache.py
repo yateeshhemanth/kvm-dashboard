@@ -1,0 +1,160 @@
+from __future__ import annotations
+
+import json
+import os
+import threading
+import time
+from typing import Any, Callable
+
+from fastapi import HTTPException
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from .models import Host
+
+
+class LibvirtCacheStore:
+    def __init__(self, ttl_s: int) -> None:
+        self.ttl_s = ttl_s
+        self.refresh_on_stale = os.getenv("LIBVIRT_REFRESH_ON_STALE", "false").strip().lower() in {"1","true","yes","on"}
+        self._schema_checked = False
+        self._schema_lock = threading.Lock()
+
+    def ensure_table(self, db: Session) -> None:
+        if self._schema_checked:
+            return
+        with self._schema_lock:
+            if self._schema_checked:
+                return
+            db.execute(text("""
+                CREATE TABLE IF NOT EXISTS host_libvirt_cache (
+                    host_id VARCHAR(128) PRIMARY KEY,
+                    vms_json TEXT NOT NULL,
+                    networks_json TEXT NOT NULL,
+                    images_json TEXT NOT NULL,
+                    pools_json TEXT NOT NULL,
+                    updated_at DOUBLE PRECISION NOT NULL,
+                    last_error TEXT,
+                    last_success_at DOUBLE PRECISION
+                )
+            """))
+            # Serialize schema changes across multi-worker deployments.
+            db.execute(text("SELECT pg_advisory_lock(8456001)"))
+            try:
+                db.execute(text("ALTER TABLE host_libvirt_cache ADD COLUMN IF NOT EXISTS last_error TEXT"))
+                db.execute(text("ALTER TABLE host_libvirt_cache ADD COLUMN IF NOT EXISTS last_success_at DOUBLE PRECISION"))
+            finally:
+                db.execute(text("SELECT pg_advisory_unlock(8456001)"))
+            db.commit()
+            self._schema_checked = True
+
+    def refresh(self, db: Session, host: Host, fetcher: Callable[[Host, str], Any]) -> dict[str, Any]:
+        vms = fetcher(host, "list_vms")
+        networks = fetcher(host, "list_networks")
+        images = fetcher(host, "list_images")
+        pools = fetcher(host, "list_storage_pools")
+        now = time.time()
+        self.ensure_table(db)
+        db.execute(
+            text("""
+                INSERT INTO host_libvirt_cache(host_id, vms_json, networks_json, images_json, pools_json, updated_at, last_error, last_success_at)
+                VALUES (:host_id, :vms_json, :networks_json, :images_json, :pools_json, :updated_at, NULL, :updated_at)
+                ON CONFLICT(host_id) DO UPDATE SET
+                vms_json=excluded.vms_json,
+                networks_json=excluded.networks_json,
+                images_json=excluded.images_json,
+                pools_json=excluded.pools_json,
+                updated_at=excluded.updated_at,
+                last_error=NULL,
+                last_success_at=excluded.updated_at
+            """),
+            {
+                "host_id": host.host_id,
+                "vms_json": json.dumps(vms),
+                "networks_json": json.dumps(networks),
+                "images_json": json.dumps(images),
+                "pools_json": json.dumps(pools),
+                "updated_at": now,
+            },
+        )
+        db.commit()
+        return {"vms": vms, "networks": networks, "images": images, "pools": pools, "updated_at": now, "cache": "miss"}
+
+    def invalidate(self, db: Session, host_id: str) -> None:
+        self.ensure_table(db)
+        db.execute(text("UPDATE host_libvirt_cache SET updated_at=0 WHERE host_id=:host_id"), {"host_id": host_id})
+        db.commit()
+
+    def get(self, db: Session, host: Host, fetcher: Callable[[Host, str], Any], *, force_refresh: bool = False) -> dict[str, Any]:
+        self.ensure_table(db)
+        row = db.execute(
+            text("SELECT vms_json, networks_json, images_json, pools_json, updated_at, last_error, last_success_at FROM host_libvirt_cache WHERE host_id=:host_id"),
+            {"host_id": host.host_id},
+        ).first()
+
+        if row and not force_refresh:
+            age_s = time.time() - float(row.updated_at)
+            if age_s <= self.ttl_s:
+                return {
+                    "vms": json.loads(row.vms_json),
+                    "networks": json.loads(row.networks_json),
+                    "images": json.loads(row.images_json),
+                    "pools": json.loads(row.pools_json),
+                    "updated_at": float(row.updated_at),
+                    "last_error": row.last_error,
+                    "last_success_at": float(row.last_success_at) if row.last_success_at else None,
+                    "cache": "hit",
+                }
+            if not self.refresh_on_stale:
+                return {
+                    "vms": json.loads(row.vms_json),
+                    "networks": json.loads(row.networks_json),
+                    "images": json.loads(row.images_json),
+                    "pools": json.loads(row.pools_json),
+                    "updated_at": float(row.updated_at),
+                    "last_error": row.last_error,
+                    "last_success_at": float(row.last_success_at) if row.last_success_at else None,
+                    "cache": "stale",
+                }
+
+        if not row and not force_refresh:
+            return {
+                "vms": [],
+                "networks": [],
+                "images": [],
+                "pools": [],
+                "updated_at": time.time(),
+                "last_error": "cache empty; use refresh=true to query libvirt",
+                "last_success_at": None,
+                "cache": "empty",
+            }
+
+        try:
+            return self.refresh(db, host, fetcher)
+        except HTTPException as exc:
+            if row:
+                db.execute(
+                    text("UPDATE host_libvirt_cache SET last_error=:last_error WHERE host_id=:host_id"),
+                    {"host_id": host.host_id, "last_error": str(exc.detail)},
+                )
+                db.commit()
+                return {
+                    "vms": json.loads(row.vms_json),
+                    "networks": json.loads(row.networks_json),
+                    "images": json.loads(row.images_json),
+                    "pools": json.loads(row.pools_json),
+                    "updated_at": float(row.updated_at),
+                    "last_error": str(exc.detail),
+                    "last_success_at": float(row.last_success_at) if row.last_success_at else None,
+                    "cache": "stale",
+                }
+            return {
+                "vms": [],
+                "networks": [],
+                "images": [],
+                "pools": [],
+                "updated_at": time.time(),
+                "last_error": str(exc.detail),
+                "last_success_at": None,
+                "cache": "error",
+            }
